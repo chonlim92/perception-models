@@ -1,4 +1,127 @@
-# Cylinder3D: Research Summary
+# Cylinder3D: Research Summary and Teaching Guide
+
+This document teaches the Cylinder3D approach from fundamentals. It is written for someone who knows PyTorch but is new to LiDAR semantic segmentation and autonomous driving.
+
+---
+
+## What Is LiDAR Semantic Segmentation?
+
+LiDAR semantic segmentation assigns a CLASS LABEL to every single point in a LiDAR point cloud. Given ~100,000 points per scan, the network must predict one of ~20 classes for each point.
+
+```
+Input: Point cloud with N points, each having (x, y, z, intensity)
+Output: N class predictions (one per point)
+
+Classes (SemanticKITTI, 19 classes):
+  Road surfaces:  road, sidewalk, parking, other-ground
+  Vehicles:       car, truck, bus, motorcycle, bicycle, other-vehicle
+  People:         person, bicyclist, motorcyclist
+  Structures:     building, fence, pole, traffic-sign
+  Nature:         vegetation, trunk, terrain
+```
+
+### Why Is This Important for Autonomous Driving?
+
+Semantic segmentation provides DENSE scene understanding:
+- **Drivable area**: Where can the car physically drive? (road vs sidewalk vs grass)
+- **Obstacle detection**: Even unusual objects (debris, fallen tree) get labeled
+- **Scene context**: Knowing "this is a sidewalk" helps predict pedestrian behavior
+- **Map building**: Create semantic maps for localization and planning
+
+### The Challenge
+
+Unlike images (regular 2D grid), point clouds are:
+- **Unstructured**: No pixel grid — points are scattered in 3D space
+- **Non-uniform density**: Dense near sensor, sparse far away
+- **Large-scale**: Each scan has 100k+ points covering 100m+ range
+- **Real-time requirement**: Must process at 10+ Hz
+
+---
+
+## Why Do We Need Cylindrical Coordinates?
+
+### The Density Problem
+
+A spinning LiDAR sensor emits laser beams radially outward. This means point density follows an **inverse-square-like distribution**:
+
+```
+Point Density vs Distance from Sensor:
+
+  Density
+    |████████
+    |██████
+    |████
+    |███
+    |██
+    |█
+    |█
+    |·
+    |·
+    +──────────────────→ Distance (r)
+    0m  10m  20m  30m  40m  50m
+
+  At 5m: ~500 points per m²
+  At 25m: ~20 points per m²
+  At 50m: ~5 points per m²
+```
+
+### What Goes Wrong with Cartesian Voxels
+
+If you divide space into a regular Cartesian grid (like CenterPoint does for detection):
+
+```
+Cartesian Grid (top-down view):
+┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+│  │  │  │  │  │  │  │  │  │  │  ← far range: 0-1 points per cell
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤     (mostly EMPTY — wasted computation)
+│  │  │  │  │  │  │  │  │  │  │
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+│  │  │  │  │··│··│  │  │  │  │  ← mid range: 5-20 points per cell
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+│  │  │··│██│██│██│██│··│  │  │  ← near range: 50-500 pts per cell
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤     (OVER-compressed — lose detail)
+│  │  │··│██│▓▓│▓▓│██│··│  │  │
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤     ▓▓ = sensor position
+│  │  │··│██│██│██│██│··│  │  │
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+│  │  │  │  │··│··│  │  │  │  │
+├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+│  │  │  │  │  │  │  │  │  │  │
+└──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+
+Problem: grid wastes 80%+ of capacity on empty far-range cells
+         while jamming hundreds of points into near-range cells
+```
+
+### The Cylindrical Solution
+
+Cylindrical coordinates naturally match the LiDAR's radial scan pattern:
+
+```
+Cylindrical Grid (top-down view, like pie slices × rings):
+
+              315°
+          ╱─────────╲
+       270° ╲ · · · · ╱ 0° (azimuth)
+          ╲  ╲ · · ╱  ╱
+           ╲  ╲ · ╱  ╱
+            ╲  ╲·╱  ╱
+     225° ───╲──╳──╱─── 45°
+            ╱  ╱·╲  ╲
+           ╱  ╱ · ╲  ╲
+          ╱  ╱ · · ╲  ╲
+       180° ╱ · · · · ╲ 90°
+          ╲─────────╱
+              135°
+
+  Inner rings: small area → few points → proportional capacity ✓
+  Outer rings: large area → few points → proportional capacity ✓
+  Each cell has roughly SIMILAR point count!
+```
+
+This is Cylinder3D's key insight: **use a coordinate system that matches the sensor's measurement pattern**.
+
+---
 
 ## Citation
 
