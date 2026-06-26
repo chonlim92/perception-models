@@ -1,164 +1,369 @@
 # BEVFormer: Evaluation Guide
 
-## Evaluation Metrics, Results, and Benchmarks
+## Understanding 3D Detection Metrics from First Principles
 
-This document provides comprehensive information about evaluating BEVFormer using the nuScenes detection metrics, interpreting results, and comparing to other methods.
+This guide teaches you everything about evaluating 3D object detection models on the nuScenes benchmark. It starts from basic concepts (precision, recall) and builds up to the full nuScenes Detection Score (NDS), explaining what each metric means physically and how to interpret results.
 
 ---
 
-## 1. nuScenes Detection Metrics
+## 1. Why Special Metrics for 3D Detection?
 
-### 1.1 Overview
+### 1.1 Why Not Just Use 2D mAP?
 
-The nuScenes detection benchmark uses two primary metrics:
+In 2D object detection (ImageNet, COCO), you evaluate using Intersection over Union (IoU) between predicted and ground-truth bounding boxes. If IoU > 0.5, it is a true positive.
 
-| Metric | Full Name | Description |
-|--------|-----------|-------------|
-| **NDS** | nuScenes Detection Score | Holistic score combining mAP + TP metrics |
-| **mAP** | mean Average Precision | Detection accuracy across distance thresholds |
+This does NOT work for 3D detection because:
 
-**NDS Formula:**
-```
-NDS = (1/10) * [5 * mAP + sum(1 - min(1, TP_metric)) for each TP metric]
-    = (1/10) * [5 * mAP + (1 - mATE) + (1 - mASE) + (1 - mAOE) + (1 - mAVE) + (1 - mAAE)]
-```
+1. **Depth errors dominate:** A prediction with perfect 2D overlap but 5m depth error is useless for driving. 2D IoU cannot capture this.
 
-Where TP metrics are capped at 1.0 (no bonus for being better than perfect).
+2. **Size matters differently in 3D:** A car predicted at the right position but with wrong height is still dangerous (you might try to drive under it). 3D IoU is complex to compute and does not cleanly separate position vs. size vs. orientation errors.
 
-### 1.2 Mean Average Precision (mAP)
+3. **Velocity and attributes matter:** For driving, knowing an object is MOVING (and how fast) is as important as knowing where it is. 2D metrics cannot capture this.
 
-#### Distance-Based Matching
+### 1.2 The nuScenes Philosophy
 
-Unlike 2D detection (IoU-based matching), nuScenes uses **center distance** for matching predictions to ground truth:
+nuScenes designed their metrics to answer: "How useful is this detection for downstream driving decisions?"
 
-| Distance Threshold | Description |
-|-------------------|-------------|
-| 0.5m | Very strict (primarily affects small objects) |
-| 1.0m | Strict |
-| 2.0m | Moderate |
-| 4.0m | Lenient |
+Their insight: separate DETECTION (did you find it?) from QUALITY (how precisely did you characterize it?). This gives:
+- **mAP**: Did you find the objects? (detection performance)
+- **TP metrics (mATE, mASE, mAOE, mAVE, mAAE)**: For the objects you found, how good are your estimates? (quality of true positives)
+- **NDS**: A single number combining both
 
-#### mAP Computation
+---
+
+## 2. Precision and Recall (Foundations)
+
+### 2.1 Definitions with a Driving Example
+
+Imagine your model processes one frame and predicts 10 bounding boxes. In reality, there are 8 objects in the scene.
 
 ```
-For each class c:
-    For each distance threshold d in [0.5, 1.0, 2.0, 4.0]:
-        1. Match predictions to GT by center distance < d
-        2. Compute precision-recall curve
-        3. Compute AP (area under interpolated P-R curve)
-    AP_c = mean(AP_d for d in thresholds)
+Predictions: 10 boxes
+Ground truth: 8 objects
 
-mAP = mean(AP_c for c in classes)
+Matching results:
+  - 6 predictions match a ground truth object  -> True Positives (TP)
+  - 4 predictions have no matching GT object   -> False Positives (FP)
+  - 2 GT objects have no matching prediction   -> False Negatives (FN)
 ```
 
-#### Key Differences from KITTI/Waymo
+**Precision** = TP / (TP + FP) = 6 / 10 = 0.60
+"Of all boxes I predicted, 60% are real objects."
+High precision means: when I say there is a car, there probably IS a car.
 
-- **Center distance** instead of IoU for matching
-- **Multiple thresholds** averaged (not single IoU threshold)
-- **No orientation** requirement for matching (orientation evaluated separately)
-- **Global frame** distances (not relative to ego)
+**Recall** = TP / (TP + FN) = 6 / 8 = 0.75
+"Of all real objects, I found 75%."
+High recall means: I find most objects, even if I sometimes hallucinate extras.
 
-### 1.3 True Positive (TP) Metrics
+### 2.2 The Precision-Recall Tradeoff
 
-For all true positive detections (correctly matched), nuScenes evaluates quality:
+Every detection model outputs a confidence score (0 to 1) for each prediction. By varying the confidence threshold:
 
-| Metric | Full Name | Unit | Range | What It Measures |
-|--------|-----------|------|-------|------------------|
-| **mATE** | mean Average Translation Error | meters | [0, inf) | Center position accuracy |
-| **mASE** | mean Average Scale Error | ratio | [0, 1] | Size accuracy (1 - IoU of aligned boxes) |
-| **mAOE** | mean Average Orientation Error | radians | [0, pi] | Heading angle accuracy |
-| **mAVE** | mean Average Velocity Error | m/s | [0, inf) | Velocity estimation accuracy |
-| **mAAE** | mean Average Attribute Error | ratio | [0, 1] | Attribute classification accuracy |
+- **High threshold (e.g., 0.9):** Only keep very confident predictions. High precision (few false alarms) but low recall (miss uncertain objects).
+- **Low threshold (e.g., 0.1):** Keep everything. High recall (find everything) but low precision (many false alarms).
 
-#### Detailed TP Metric Definitions
-
-**mATE (Translation Error):**
 ```
-ATE = Euclidean distance between predicted and GT center (2D, x-y plane)
-    = sqrt((x_pred - x_gt)^2 + (y_pred - y_gt)^2)
+    Precision
+    1.0 |*
+        | *
+        |  *
+        |   *
+        |    **
+        |      ***
+        |         ****
+        |             *****
+    0.0 +--------------------> Recall
+        0.0                1.0
 
-mATE = mean(ATE) over all true positive matches, across all classes
-```
-
-**mASE (Scale Error):**
-```
-ASE = 1 - IoU(pred_box_aligned, gt_box_aligned)
-    where boxes are aligned at center and orientation (only size differs)
-
-mASE = mean(ASE) over all true positive matches
+    The Precision-Recall (P-R) Curve
+    Area under this curve = Average Precision (AP)
 ```
 
-**mAOE (Orientation Error):**
+### 2.3 Why This Matters for Driving
+
+- **False Positive (phantom detection):** Your car brakes for a non-existent pedestrian. Annoying but safe.
+- **False Negative (missed detection):** Your car does not see a real pedestrian. Potentially fatal.
+
+For autonomous driving, recall at reasonable precision is critical. You would rather have some false alarms than miss a single pedestrian.
+
+---
+
+## 3. Average Precision (AP) in nuScenes
+
+### 3.1 Distance-Based Matching (Not IoU!)
+
+Unlike COCO/KITTI which use IoU for matching, nuScenes uses **2D center distance** on the ground plane:
+
 ```
-AOE = |angle_diff(yaw_pred, yaw_gt)|
+match_distance = sqrt((x_pred - x_gt)^2 + (y_pred - y_gt)^2)
+
+A prediction matches a GT if: match_distance < threshold
+```
+
+Why center distance instead of IoU?
+1. Simpler and faster to compute in 3D
+2. Cleanly separates detection (finding the object) from quality (size/orientation)
+3. IoU in 3D is problematic for thin/elongated objects
+
+### 3.2 Multiple Distance Thresholds
+
+nuScenes evaluates at 4 distance thresholds and averages:
+
+| Threshold | What it measures | Challenge level |
+|-----------|------------------|-----------------|
+| 0.5 m | Very precise localization | Hard (must be within 0.5m) |
+| 1.0 m | Good localization | Moderate |
+| 2.0 m | Reasonable localization | Forgiving |
+| 4.0 m | Approximate detection | Easy (just find it roughly) |
+
+**AP for one class at one threshold:**
+
+```
+1. Sort all predictions by confidence (highest first)
+2. For each prediction (in order):
+   - If it matches an unmatched GT within threshold: mark as TP
+   - If no matching GT: mark as FP
+3. Compute precision and recall at each step
+4. Compute area under the interpolated P-R curve = AP
+```
+
+**AP for one class (averaged over thresholds):**
+```
+AP_class = mean(AP_0.5m, AP_1.0m, AP_2.0m, AP_4.0m)
+```
+
+**mAP (mean over all classes):**
+```
+mAP = mean(AP_class for each of 10 classes)
+```
+
+### 3.3 Worked Example
+
+Imagine class "car" with threshold 2.0m. Your model produces 5 car predictions ranked by confidence:
+
+```
+Pred  Confidence  Distance to nearest GT  Match?  Cumulative TP  Precision  Recall
+----  ----------  ----------------------  ------  -------------  ---------  ------
+ 1     0.95       0.8m                    TP      1              1/1=1.00   1/4=0.25
+ 2     0.90       1.5m                    TP      2              2/2=1.00   2/4=0.50
+ 3     0.80       3.5m                    FP      2              2/3=0.67   2/4=0.50
+ 4     0.70       1.2m                    TP      3              3/4=0.75   3/4=0.75
+ 5     0.60       0.3m                    TP      4              4/5=0.80   4/4=1.00
+
+(Assume 4 GT cars total)
+
+P-R points: (0.25, 1.0), (0.50, 1.0), (0.50, 0.67), (0.75, 0.75), (1.0, 0.80)
+AP = area under interpolated P-R curve ~ 0.85
+```
+
+---
+
+## 4. nuScenes Detection Score (NDS)
+
+### 4.1 The Formula
+
+```
+NDS = (1/10) * [5 * mAP + sum of (1 - min(1, TP_metric)) for 5 TP metrics]
+
+Expanded:
+NDS = (1/10) * [5*mAP + (1-min(1,mATE)) + (1-min(1,mASE)) + (1-min(1,mAOE))
+                      + (1-min(1,mAVE)) + (1-min(1,mAAE))]
+```
+
+### 4.2 Why This Formula?
+
+- **50% weight on mAP:** Finding objects matters
+- **50% weight on TP quality:** Characterizing found objects also matters
+- **min(1, metric):** Caps the penalty at 1.0 (no bonus for being worse than 1.0 in any metric; also no bonus for being better than 0.0)
+- **1 - metric:** Converts "error" (lower is better) to "score" (higher is better)
+- **(1/10) normalization:** Keeps NDS in [0, 1] range
+
+### 4.3 What Good NDS Values Look Like
+
+| NDS Range | Interpretation | Examples |
+|-----------|---------------|----------|
+| 0.0 - 0.3 | Poor | Random or heavily broken models |
+| 0.3 - 0.4 | Below average | Early camera-only methods (2020) |
+| 0.4 - 0.5 | Decent | Basic monocular methods, FCOS3D |
+| 0.5 - 0.6 | Strong | BEVFormer-Base (0.517 val, 0.569 test) |
+| 0.6 - 0.7 | Excellent | BEVFormer-Large, best camera-only (2023) |
+| 0.7+ | State-of-the-art | LiDAR methods, multi-modal fusion |
+
+---
+
+## 5. True Positive Quality Metrics (Detailed)
+
+For every True Positive detection (a prediction correctly matched to a GT object), nuScenes measures how GOOD the match is across 5 dimensions.
+
+### 5.1 mATE -- Mean Average Translation Error
+
+**What it measures:** How far is your predicted center from the true center?
+
+**Formula:**
+```
+ATE = sqrt((x_pred - x_gt)^2 + (y_pred - y_gt)^2)    [2D ground-plane distance]
+mATE = mean of ATE across all TPs, across all classes
+```
+
+**Physical intuition:** "Your detected car's center is on average 0.67m away from where it actually is."
+
+**What is good vs bad:**
+| mATE Value | Interpretation | Impact on Driving |
+|------------|---------------|-------------------|
+| < 0.3 m | Excellent | Sub-lane-width accuracy |
+| 0.3 - 0.5 m | Very good | Within a parking space width |
+| 0.5 - 0.8 m | Good | BEVFormer territory (0.673) |
+| 0.8 - 1.2 m | Moderate | Might confuse adjacent lanes |
+| > 1.5 m | Poor | Object might be in wrong lane |
+
+**Which classes are hardest?**
+- trailer (mATE ~1.04m): Very long, center is far from visible part
+- construction_vehicle (mATE ~1.06m): Rare, variable shape
+- car (mATE ~0.46m): Common, regular shape, easiest
+
+**What causes high mATE:**
+- Low BEV resolution (each cell = 0.512m, so inherent quantization)
+- Depth errors (camera-based methods struggle at distance)
+- Few pixels on distant objects
+
+### 5.2 mASE -- Mean Average Scale Error
+
+**What it measures:** How wrong is your predicted box size, ignoring position and orientation?
+
+**Formula:**
+```
+ASE = 1 - IoU_3D(pred_box_aligned, gt_box_aligned)
+
+Where "aligned" means: move both boxes to origin, align orientations,
+then compute 3D IoU (only size differs).
+
+mASE = mean of ASE across all TPs
+```
+
+**Physical intuition:** "Your predicted box overlaps with the true box by 73% when position and orientation are removed. The 27% error is from size mismatch."
+
+**What is good vs bad:**
+| mASE Value | Interpretation |
+|------------|---------------|
+| < 0.20 | Excellent size estimation |
+| 0.20 - 0.30 | Good (BEVFormer: 0.274) |
+| 0.30 - 0.40 | Moderate |
+| > 0.40 | Poor -- significant size errors |
+
+**Which classes are hardest?**
+- construction_vehicle (mASE ~0.48): Hugely variable size (small bobcat vs giant crane)
+- traffic_cone (mASE ~0.34): Very small, hard to estimate precisely
+- car (mASE ~0.15): Very consistent size across instances
+
+### 5.3 mAOE -- Mean Average Orientation Error
+
+**What it measures:** How wrong is your predicted heading angle?
+
+**Formula:**
+```
+AOE = smallest angle between predicted and GT yaw
     = min(|yaw_pred - yaw_gt|, 2*pi - |yaw_pred - yaw_gt|)
 
-Note: For symmetric objects (barriers, traffic cones), orientation
-is measured modulo pi (180-degree ambiguity allowed)
+For rotationally symmetric objects (barrier, traffic_cone):
+    AOE is computed modulo pi (180-degree ambiguity allowed)
 
-mAOE = mean(AOE) over all true positive matches
+mAOE = mean of AOE across all TPs
 ```
 
-**mAVE (Velocity Error):**
-```
-AVE = L2 norm of velocity difference
-    = sqrt((vx_pred - vx_gt)^2 + (vy_pred - vy_gt)^2)
+**Physical intuition:** "Your predicted car heading is off by about 21 degrees on average" (0.372 rad).
 
-mAVE = mean(AVE) over all true positive matches
-Note: Only computed for classes that can move (vehicles, pedestrians, cyclists)
-      Static classes (barrier, traffic_cone) excluded
+**What is good vs bad:**
+| mAOE Value | Degrees | Interpretation |
+|------------|---------|---------------|
+| < 0.1 rad | < 6 deg | Excellent |
+| 0.1 - 0.3 | 6-17 deg | Very good |
+| 0.3 - 0.5 | 17-29 deg | Good (BEVFormer: 0.372 = ~21 deg) |
+| 0.5 - 1.0 | 29-57 deg | Moderate -- might confuse direction |
+| > 1.0 rad | > 57 deg | Poor -- essentially wrong direction |
+
+**Which classes are hardest?**
+- construction_vehicle (mAOE ~1.13 rad): Irregular shape, unclear "front"
+- bicycle (mAOE ~0.66 rad): Thin, often only a few pixels
+- car (mAOE ~0.08 rad): Clear front/back distinction
+
+### 5.4 mAVE -- Mean Average Velocity Error
+
+**What it measures:** How wrong is your predicted velocity?
+
+**Formula:**
+```
+AVE = sqrt((vx_pred - vx_gt)^2 + (vy_pred - vy_gt)^2)   [L2 norm of velocity difference]
+mAVE = mean of AVE across all TPs
+
+Note: Only computed for MOVING object classes (vehicles, pedestrians, cyclists).
+      Static classes (barrier, traffic_cone) are excluded.
 ```
 
-**mAAE (Attribute Error):**
-```
-AAE = 1 - accuracy(attribute_pred, attribute_gt)
-    = fraction of TPs with incorrect attribute prediction
+**Physical intuition:** "Your predicted velocity is off by 0.39 m/s on average" (about 1.4 km/h).
 
-mAAE = mean(AAE) over all applicable classes
+**What is good vs bad:**
+| mAVE Value | km/h equivalent | Interpretation |
+|------------|----------------|---------------|
+| < 0.3 m/s | < 1.1 km/h | Excellent |
+| 0.3 - 0.5 | 1.1 - 1.8 km/h | Good (BEVFormer: 0.394) |
+| 0.5 - 1.0 | 1.8 - 3.6 km/h | Moderate |
+| > 1.0 | > 3.6 km/h | Poor -- cannot trust velocity |
+| > 2.0 | > 7.2 km/h | Very poor -- basically no velocity info |
+
+**Why velocity matters for driving:**
+- Prediction of future positions depends on velocity
+- Time-to-collision calculations need velocity
+- Decision to yield vs. proceed depends on approaching speed
+
+**Key insight:** Without temporal fusion, mAVE is typically >0.8 m/s. BEVFormer's temporal self-attention reduces this to 0.394 -- demonstrating that temporal fusion is essential for velocity estimation.
+
+### 5.5 mAAE -- Mean Average Attribute Error
+
+**What it measures:** Did you correctly predict the object's attribute (behavioral state)?
+
+**Attributes in nuScenes:**
+- Vehicles: {moving, stopped, parked}
+- Pedestrians: {moving, standing, sitting_lying_down}
+- Cyclists: {with_rider, without_rider}
+
+**Formula:**
 ```
+AAE = 1 - accuracy(predicted_attribute, gt_attribute)
+mAAE = mean fraction of incorrect attribute predictions across TPs
+```
+
+**Physical intuition:** "You confused a parked car with a stopped car (or vice versa) about 20% of the time."
+
+**Why it matters:** A parked car will never move, so you can pass close. A stopped car might suddenly start moving, requiring more caution.
 
 ---
 
-## 2. Running Evaluation
+## 6. How to Interpret Results
 
-### 2.1 Evaluation Command
+### 6.1 Common Patterns and What They Mean
 
-```bash
-# Standard evaluation on validation set
-./tools/dist_test.sh \
-    projects/configs/bevformer/bevformer_base.py \
-    work_dirs/bevformer_base/epoch_24.pth \
-    8 \
-    --eval bbox
+**Pattern: High mAP but high mAVE (>0.8)**
+- Diagnosis: Model has no temporal fusion
+- Fix: Enable temporal self-attention, verify can_bus data is loaded
 
-# Single-GPU evaluation
-python tools/test.py \
-    projects/configs/bevformer/bevformer_base.py \
-    work_dirs/bevformer_base/epoch_24.pth \
-    --eval bbox \
-    --gpu-ids 0
+**Pattern: Low mAP but low TP errors**
+- Diagnosis: Model detects few objects but those it detects are precise
+- This suggests: confidence threshold too high, or model under-trained
+- Fix: Lower score threshold, train more epochs
 
-# Evaluation with visualization
-python tools/test.py \
-    projects/configs/bevformer/bevformer_base.py \
-    work_dirs/bevformer_base/epoch_24.pth \
-    --eval bbox \
-    --show-dir work_dirs/bevformer_base/visualizations/
-```
+**Pattern: High mATE (>1.0m)**
+- Diagnosis: Poor localization, likely depth-related
+- Causes: Wrong calibration matrices, low BEV resolution, poor backbone
+- Fix: Verify calibration, increase BEV resolution, use better pretrained backbone
 
-### 2.2 Evaluation Output Format
+**Pattern: Good cars/pedestrians but terrible construction_vehicle/trailer**
+- Diagnosis: Class imbalance (rare classes under-represented)
+- Fix: Enable CBGS (class-balanced group sampling), increase training epochs
+
+### 6.2 Reading Per-Class Results
 
 ```
----------- nuScenes Detection Evaluation ----------
-mAP: 0.4163
-mATE: 0.6728
-mASE: 0.2731
-mAOE: 0.3718
-mAVE: 0.3944
-mAAE: 0.1981
-NDS: 0.5170
-
----------- Per-Class Results ----------
+Example output:
          Class    AP    ATE    ASE    AOE    AVE    AAE
            car 0.594  0.462  0.154  0.081  0.359  0.177
          truck 0.388  0.692  0.207  0.096  0.348  0.198
@@ -172,286 +377,152 @@ construction_v 0.091  1.058  0.481  1.125  0.121  0.362
   traffic_cone 0.532  0.404  0.342  nan    nan    nan
 ```
 
-### 2.3 Generating Submission File
+**How to read this:**
+- `car` AP 0.594: Best detected class (common, large, regular shape)
+- `construction_v` AP 0.091: Worst class (rare, variable appearance)
+- `bus` AVE 0.846: High velocity error for buses (they accelerate/decelerate differently)
+- `barrier`/`traffic_cone` AVE=nan: Static objects, velocity not evaluated
+- `traffic_cone` AOE=nan: Symmetric object, orientation not evaluated
+
+### 6.3 Fair Comparison Checklist
+
+When comparing BEVFormer to other papers, verify:
+
+- [ ] Same dataset split (v1.0-trainval, standard train/val division)
+- [ ] Same input resolution (900x1600 unless noted)
+- [ ] Same backbone pretraining (FCOS3D pretrained vs ImageNet-only: ~3 NDS difference!)
+- [ ] Same number of training epochs (24)
+- [ ] Same data augmentation (grid mask, photometric distortion)
+- [ ] Test-time augmentation (TTA) noted if used (adds ~1-2 NDS)
+- [ ] Single model vs ensemble clearly stated
+
+**Common sources of unfair comparison:**
+- Paper A uses V2-99 backbone (stronger) vs Paper B uses ResNet-50 (weaker)
+- Paper A uses 48 epochs vs Paper B uses 24 epochs
+- Paper A uses TTA (flip) vs Paper B without TTA
+
+---
+
+## 7. Per-Class Analysis
+
+### 7.1 Why Some Classes Are Much Harder
+
+| Class | # Annotations (train) | Avg Size (m) | Avg Distance | AP | Primary Challenge |
+|-------|----------------------|--------------|--------------|-----|-------------------|
+| car | ~340,000 | 4.6 x 1.9 x 1.7 | 25m | 0.594 | None (easiest) |
+| pedestrian | ~160,000 | 0.7 x 0.7 x 1.8 | 20m | 0.449 | Small, variable pose |
+| barrier | ~120,000 | 0.5 x 2.5 x 1.0 | 15m | 0.534 | Static, regular |
+| traffic_cone | ~70,000 | 0.4 x 0.4 x 1.0 | 12m | 0.532 | Very small but distinctive color |
+| truck | ~65,000 | 6.9 x 2.5 x 2.8 | 30m | 0.388 | Large, sometimes far |
+| bus | ~12,000 | 11.1 x 2.9 x 3.5 | 35m | 0.445 | Rare, very large |
+| trailer | ~20,000 | 12.3 x 2.9 x 3.9 | 40m | 0.205 | Very large, often occluded |
+| motorcycle | ~15,000 | 2.1 x 0.8 x 1.5 | 22m | 0.393 | Small, fast-moving |
+| bicycle | ~10,000 | 1.7 x 0.6 x 1.3 | 18m | 0.331 | Very small, rare |
+| construction_v | ~7,000 | 6.4 x 2.8 x 3.1 | 30m | 0.091 | Extremely rare, variable shape |
+
+### 7.2 The "Long Tail" Problem
+
+Construction vehicles have 48x fewer training examples than cars. Even with class-balanced sampling, the network cannot learn all the visual variations of cranes, excavators, dump trucks, and cement mixers from just 7,000 examples.
+
+### 7.3 Distance Distribution Effects
+
+Most annotations are within 30m. Beyond 40m, objects occupy very few pixels:
+```
+At 20m: a car is ~200 pixels wide in the image
+At 40m: a car is ~100 pixels wide
+At 60m: a car is ~65 pixels wide
+At 80m: a car is ~50 pixels wide  (hard to even identify class)
+```
+
+---
+
+## 8. Temporal Consistency Evaluation
+
+### 8.1 Why Single-Frame Metrics Are Not Enough
+
+Imagine a model that detects a parked car in frame 1, misses it in frame 2, detects it again in frame 3. Per-frame mAP looks fine (2/3 recall), but the driving experience is terrible -- the car "flickers" in and out of existence, confusing the planner.
+
+### 8.2 Tracking-Based Metrics
+
+| Metric | Full Name | BEVFormer-Base | What It Measures |
+|--------|-----------|----------------|------------------|
+| AMOTA | Avg Multi-Object Tracking Accuracy | 0.412 | Overall tracking quality |
+| AMOTP | Avg Multi-Object Tracking Precision | 1.132m | Localization of tracked objects |
+| ID Switches | Identity switches | 842 | How often tracked ID changes |
+| Fragmentation | Track fragmentation | 1,247 | How often tracks break/resume |
+
+### 8.3 Temporal Consistency Improvements
+
+| Metric | Single Frame | With Temporal | Improvement |
+|--------|-------------|---------------|-------------|
+| False Positives / frame | 4.2 | 3.1 | -26% fewer phantom detections |
+| False Negatives / frame | 5.8 | 4.9 | -16% fewer missed objects |
+| Box Jitter (ATE std) | 0.31m | 0.19m | -39% more stable positions |
+| Velocity Error | 0.842 m/s | 0.394 m/s | -53% better velocity |
+| Heading Jitter | 0.12 rad | 0.08 rad | -33% more stable orientation |
+
+Temporal fusion makes detections significantly more stable across frames, which is crucial for downstream tracking and planning.
+
+---
+
+## 9. Running Evaluation
+
+### 9.1 Standard Evaluation Command
 
 ```bash
-# For official leaderboard submission
+# Multi-GPU evaluation (faster)
+./tools/dist_test.sh \
+    projects/configs/bevformer/bevformer_base.py \
+    work_dirs/bevformer_base/epoch_24.pth \
+    8 \
+    --eval bbox
+
+# Single-GPU evaluation
+python tools/test.py \
+    projects/configs/bevformer/bevformer_base.py \
+    work_dirs/bevformer_base/epoch_24.pth \
+    --eval bbox \
+    --gpu-ids 0
+```
+
+### 9.2 Understanding the Output
+
+The evaluation produces a table like:
+
+```
+---------- nuScenes Detection Evaluation ----------
+mAP: 0.4163
+mATE: 0.6728
+mASE: 0.2731
+mAOE: 0.3718
+mAVE: 0.3944
+mAAE: 0.1981
+NDS: 0.5170
+```
+
+**Interpreting these numbers:**
+- mAP 0.416: Detecting about 42% of objects (averaged across distances/classes)
+- mATE 0.673: Average position error is 67cm
+- NDS 0.517: Overall score in [0,1] -- solid camera-only performance
+
+### 9.3 Generating Submission Files
+
+```bash
+# Generate JSON for leaderboard submission (nuScenes test set)
 python tools/test.py \
     projects/configs/bevformer/bevformer_base.py \
     work_dirs/bevformer_base/epoch_24.pth \
     --format-only \
     --eval-options jsonfile_prefix=results/bevformer_submit
 
-# Creates: results/bevformer_submit/results_nusc.json
-# Submit this file to https://eval.ai/web/challenges/challenge-page/356/
+# Output: results/bevformer_submit/results_nusc.json
+# Submit to: https://eval.ai/web/challenges/challenge-page/356/
 ```
 
----
-
-## 3. BEVFormer Results
-
-### 3.1 Main Results (nuScenes Validation Set)
-
-| Model | Backbone | Epochs | NDS | mAP | mATE | mASE | mAOE | mAVE | mAAE |
-|-------|----------|--------|-----|-----|------|------|------|------|------|
-| BEVFormer-Small | R101 | 24 | 0.462 | 0.349 | 0.725 | 0.279 | 0.407 | 0.521 | 0.209 |
-| BEVFormer-Base | R101-DCN | 24 | 0.517 | 0.416 | 0.673 | 0.274 | 0.372 | 0.394 | 0.198 |
-
-### 3.2 Main Results (nuScenes Test Set)
-
-| Model | Backbone | NDS | mAP | mATE | mASE | mAOE | mAVE | mAAE |
-|-------|----------|-----|-----|------|------|------|------|------|
-| BEVFormer-Small | R101 | 0.478 | 0.370 | 0.698 | 0.281 | 0.423 | 0.497 | 0.208 |
-| BEVFormer-Base | R101-DCN | 0.569 | 0.481 | 0.582 | 0.256 | 0.375 | 0.378 | 0.126 |
-| BEVFormer-Large | V2-99 | 0.592 | 0.517 | 0.549 | 0.253 | 0.358 | 0.322 | 0.118 |
-
-### 3.3 Per-Class AP (BEVFormer-Base, Val Set)
-
-| Class | AP@0.5m | AP@1.0m | AP@2.0m | AP@4.0m | AP (mean) |
-|-------|---------|---------|---------|---------|-----------|
-| car | 0.321 | 0.564 | 0.726 | 0.765 | 0.594 |
-| truck | 0.143 | 0.335 | 0.509 | 0.564 | 0.388 |
-| bus | 0.171 | 0.404 | 0.580 | 0.626 | 0.445 |
-| trailer | 0.032 | 0.125 | 0.293 | 0.369 | 0.205 |
-| construction_vehicle | 0.012 | 0.054 | 0.130 | 0.169 | 0.091 |
-| pedestrian | 0.201 | 0.425 | 0.571 | 0.600 | 0.449 |
-| motorcycle | 0.177 | 0.372 | 0.495 | 0.527 | 0.393 |
-| bicycle | 0.149 | 0.308 | 0.422 | 0.447 | 0.331 |
-| barrier | 0.254 | 0.499 | 0.656 | 0.726 | 0.534 |
-| traffic_cone | 0.289 | 0.521 | 0.651 | 0.669 | 0.532 |
-
-### 3.4 Distance-Binned Performance
-
-| Distance | mAP | mATE | Notes |
-|----------|-----|------|-------|
-| 0-20m | 0.58 | 0.38 | Best performance (high resolution) |
-| 20-40m | 0.44 | 0.62 | Good performance |
-| 40-60m | 0.31 | 0.89 | Degraded (lower resolution) |
-| 60-80m | 0.18 | 1.21 | Significantly degraded |
-| 80-100m | 0.09 | 1.65 | Poor (very few pixels) |
-
----
-
-## 4. Ablation Studies
-
-### 4.1 Effect of Temporal Frames
-
-| Temporal Frames | NDS | mAP | mAVE | Delta NDS |
-|-----------------|-----|-----|------|-----------|
-| 1 (no temporal) | 0.492 | 0.390 | 0.842 | baseline |
-| 2 (current + 1 prev) | 0.505 | 0.403 | 0.468 | +1.3 |
-| 3 | 0.512 | 0.410 | 0.412 | +2.0 |
-| 4 (default) | 0.517 | 0.416 | 0.394 | +2.5 |
-| 8 | 0.519 | 0.418 | 0.381 | +2.7 |
-
-**Key insight:** Temporal fusion most dramatically improves velocity estimation (mAVE drops from 0.842 to 0.394). Diminishing returns beyond 4 frames.
-
-### 4.2 BEV Resolution
-
-| BEV Size | Resolution | NDS | mAP | Memory | Speed |
-|----------|-----------|-----|-----|--------|-------|
-| 50 x 50 | 2.048 m/cell | 0.451 | 0.342 | 6 GB | 15 FPS |
-| 100 x 100 | 1.024 m/cell | 0.489 | 0.383 | 10 GB | 12 FPS |
-| 150 x 150 | 0.683 m/cell | 0.507 | 0.405 | 14 GB | 10 FPS |
-| 200 x 200 | 0.512 m/cell | 0.517 | 0.416 | 18 GB | 9 FPS |
-| 300 x 300 | 0.341 m/cell | 0.521 | 0.420 | 32 GB | 5 FPS |
-
-**Key insight:** 200x200 provides the best accuracy/efficiency trade-off. Higher resolutions give marginal gains with significant memory and speed costs.
-
-### 4.3 Number of Encoder Layers
-
-| Encoder Layers | NDS | mAP | Parameters | Speed |
-|----------------|-----|-----|-----------|-------|
-| 1 | 0.467 | 0.357 | 65.0M | 14 FPS |
-| 2 | 0.485 | 0.380 | 66.0M | 13 FPS |
-| 3 | 0.498 | 0.396 | 67.0M | 11 FPS |
-| 4 | 0.508 | 0.408 | 68.0M | 10 FPS |
-| 6 (default) | 0.517 | 0.416 | 70.0M | 9 FPS |
-| 8 | 0.519 | 0.418 | 72.0M | 7 FPS |
-
-**Key insight:** Performance saturates around 6 layers. The encoder is the most computationally expensive component.
-
-### 4.4 Number of Reference Points (Heights)
-
-| N_ref (heights) | NDS | mAP | Description |
-|-----------------|-----|-----|-------------|
-| 1 | 0.487 | 0.381 | Single height (ground plane) |
-| 2 | 0.502 | 0.400 | Two heights |
-| 4 (default) | 0.517 | 0.416 | Four heights |
-| 8 | 0.518 | 0.417 | Eight heights (diminishing returns) |
-
-### 4.5 Backbone Comparison
-
-| Backbone | Pretrain | NDS | mAP | Backbone Params | FLOPs |
-|----------|----------|-----|-----|-----------------|-------|
-| ResNet-50 | ImageNet | 0.462 | 0.349 | 25.6M | 4.1G |
-| ResNet-101 | ImageNet | 0.478 | 0.370 | 44.5M | 7.8G |
-| ResNet-101-DCN | FCOS3D | 0.517 | 0.416 | 44.5M | 8.2G |
-| V2-99 | DD3D | 0.535 | 0.440 | 52.7M | 14.3G |
-
-**Key insight:** Pretrained weights (FCOS3D or DD3D) significantly impact final performance (+3-5 NDS over ImageNet pretraining).
-
-### 4.6 Effect of Key Components
-
-| Configuration | NDS | mAP | Delta |
-|--------------|-----|-----|-------|
-| Full BEVFormer-Base | 0.517 | 0.416 | - |
-| Without temporal self-attention | 0.492 | 0.390 | -2.5 |
-| Without deformable attention (use full attention) | 0.509 | 0.410 | -0.8 |
-| Without multi-scale features (single scale) | 0.498 | 0.393 | -1.9 |
-| Without grid mask augmentation | 0.507 | 0.404 | -1.0 |
-| Without CBGS | 0.503 | 0.398 | -1.4 |
-| Without can_bus (ego-motion) | 0.494 | 0.391 | -2.3 |
-
----
-
-## 5. Temporal Consistency Metrics
-
-### 5.1 Tracking-Based Evaluation
-
-While BEVFormer is primarily a detection model, temporal consistency can be evaluated:
+### 9.4 Visualization for Debugging
 
 ```bash
-# Run tracking on BEVFormer detections
-python tools/track.py \
-    projects/configs/bevformer/bevformer_base.py \
-    work_dirs/bevformer_base/epoch_24.pth \
-    --eval track
-```
-
-### 5.2 Consistency Metrics
-
-| Metric | Description | BEVFormer-Base |
-|--------|-------------|----------------|
-| AMOTA | Average Multi-Object Tracking Accuracy | 0.412 |
-| AMOTP | Average Multi-Object Tracking Precision | 1.132 |
-| ID Switches | Number of identity switches | 842 |
-| Fragmentation | Track fragmentation count | 1,247 |
-| Velocity Consistency | Std of velocity across frames | 0.52 m/s |
-
-### 5.3 Temporal vs. Single-Frame Detection
-
-| Metric | Single Frame | With Temporal | Improvement |
-|--------|-------------|---------------|-------------|
-| False Positives / frame | 4.2 | 3.1 | -26% |
-| False Negatives / frame | 5.8 | 4.9 | -16% |
-| Box Jitter (mATE std) | 0.31m | 0.19m | -39% |
-| Velocity Error | 0.842 m/s | 0.394 m/s | -53% |
-| Heading Jitter | 0.12 rad | 0.08 rad | -33% |
-
----
-
-## 6. Benchmark Comparison
-
-### 6.1 Camera-Only Methods (nuScenes Test Set)
-
-| Method | Year | Backbone | NDS | mAP | mATE | mASE | mAOE | mAVE | mAAE |
-|--------|------|----------|-----|-----|------|------|------|------|------|
-| FCOS3D | 2021 | R101 | 0.428 | 0.358 | 0.690 | 0.249 | 0.452 | 1.434 | 0.124 |
-| DETR3D | 2022 | V2-99 | 0.479 | 0.412 | 0.641 | 0.255 | 0.394 | 0.845 | 0.133 |
-| PETR | 2022 | V2-99 | 0.504 | 0.441 | 0.593 | 0.249 | 0.383 | 0.808 | 0.132 |
-| BEVDet | 2022 | Swin-B | 0.488 | 0.396 | 0.556 | 0.239 | 0.414 | 0.819 | 0.140 |
-| BEVDet4D | 2022 | Swin-B | 0.515 | 0.421 | 0.517 | 0.241 | 0.386 | 0.556 | 0.138 |
-| **BEVFormer** | **2022** | **R101-DCN** | **0.569** | **0.481** | **0.582** | **0.256** | **0.375** | **0.378** | **0.126** |
-| **BEVFormer** | **2022** | **V2-99** | **0.592** | **0.517** | **0.549** | **0.253** | **0.358** | **0.322** | **0.118** |
-| PolarFormer | 2023 | V2-99 | 0.572 | 0.493 | 0.556 | 0.256 | 0.364 | 0.440 | 0.127 |
-| SOLOFusion | 2023 | R101-DCN | 0.582 | 0.483 | 0.503 | 0.264 | 0.381 | 0.246 | 0.207 |
-| StreamPETR | 2023 | V2-99 | 0.592 | 0.504 | 0.540 | 0.247 | 0.370 | 0.283 | 0.120 |
-
-### 6.2 LiDAR-Based Methods (for reference)
-
-| Method | Year | NDS | mAP | Gap to BEVFormer |
-|--------|------|-----|-----|------------------|
-| CenterPoint | 2021 | 0.673 | 0.603 | +8.1 NDS |
-| TransFusion-L | 2022 | 0.702 | 0.652 | +11.0 NDS |
-| LargeKernel3D | 2023 | 0.714 | 0.657 | +12.2 NDS |
-
-### 6.3 Multi-Modal Methods (Camera + LiDAR)
-
-| Method | Year | NDS | mAP | Sensors |
-|--------|------|-----|-----|---------|
-| BEVFusion | 2022 | 0.714 | 0.685 | Camera + LiDAR |
-| TransFusion | 2022 | 0.718 | 0.682 | Camera + LiDAR |
-| DeepInteraction | 2023 | 0.726 | 0.697 | Camera + LiDAR |
-
-### 6.4 Key Observations
-
-1. **BEVFormer leads camera-only methods** at time of publication, especially in velocity estimation (mAVE)
-2. **Gap to LiDAR** remains significant (~10 NDS) but BEVFormer represents a major step in closing it
-3. **Temporal fusion** is the key differentiator vs. single-frame methods (DETR3D, PETR)
-4. **Subsequent methods** (StreamPETR, SOLOFusion) match or slightly exceed BEVFormer, often building on its insights
-
----
-
-## 7. Per-Class Analysis
-
-### 7.1 Strengths
-
-| Class | BEVFormer AP | Why BEVFormer Works Well |
-|-------|-------------|--------------------------|
-| car | 0.594 | Large, abundant, consistent appearance |
-| barrier | 0.534 | Static, regular shape, high contrast |
-| traffic_cone | 0.532 | Distinctive color, predictable size |
-| pedestrian | 0.449 | Temporal helps with velocity, common class |
-
-### 7.2 Weaknesses
-
-| Class | BEVFormer AP | Why It Struggles |
-|-------|-------------|------------------|
-| construction_vehicle | 0.091 | Rare, highly variable appearance |
-| trailer | 0.205 | Large, often partially occluded |
-| bicycle | 0.331 | Small, rare, fast-moving |
-| motorcycle | 0.393 | Similar to bicycle, higher speed |
-
-### 7.3 Failure Mode Analysis
-
-| Failure Mode | Affected Classes | Frequency | Potential Fix |
-|--------------|-----------------|-----------|---------------|
-| Distance > 60m | All | 20% of FN | Higher resolution BEV at distance |
-| Heavy occlusion | truck, trailer | 15% of FN | Longer temporal window |
-| Night/low light | pedestrian, bicycle | 10% of FN | Better augmentation, night pretraining |
-| Similar objects | motorcycle/bicycle | 8% of FP | Attribute-aware detection |
-| Calibration drift | All | 5% of errors | Online calibration refinement |
-
----
-
-## 8. Evaluation Best Practices
-
-### 8.1 Fair Comparison Checklist
-
-When comparing BEVFormer to other methods, ensure:
-
-- [ ] Same dataset split (v1.0-trainval, train/val division)
-- [ ] Same input resolution (900x1600 unless explicitly noted)
-- [ ] Same backbone pretraining (FCOS3D pretrained vs. ImageNet only)
-- [ ] Same training epochs (24)
-- [ ] Same data augmentation (grid mask, photometric distortion)
-- [ ] Test-time augmentation noted if used (flip, multi-scale)
-- [ ] Single model vs. ensemble clearly stated
-
-### 8.2 Statistical Significance
-
-- Single-run results can vary by ±0.5 NDS due to random initialization
-- For publishable comparisons, report mean ± std over 3 runs
-- Differences < 1.0 NDS may not be statistically significant
-
-### 8.3 Efficiency Metrics
-
-When reporting results, also consider:
-
-| Metric | BEVFormer-Base | Description |
-|--------|---------------|-------------|
-| FPS | 9.4 | Frames per second (A100) |
-| Latency | 106 ms | End-to-end inference time |
-| GPU Memory | 18 GB | Training memory (single GPU) |
-| Parameters | 70M | Total model parameters |
-| FLOPs | ~200G | Per-sample computation |
-| Training time | 28h (8x A100) | Total training duration |
-
-### 8.4 Visualization for Debugging
-
-```bash
-# Visualize predictions vs. ground truth
+# Visualize predictions overlaid on camera images and BEV
 python tools/visualize.py \
     projects/configs/bevformer/bevformer_base.py \
     work_dirs/bevformer_base/epoch_24.pth \
@@ -459,116 +530,146 @@ python tools/visualize.py \
     --show-bev \
     --show-cameras \
     --score-thr 0.3
-
-# Visualize BEV feature maps
-python tools/visualize_bev.py \
-    projects/configs/bevformer/bevformer_base.py \
-    work_dirs/bevformer_base/epoch_24.pth \
-    --save-dir bev_vis/
 ```
 
 ---
 
-## 9. Evaluation Configuration Reference
+## 10. Debugging Poor Results
 
-### 9.1 Detection Evaluation Config
+### 10.1 Systematic Diagnosis
 
-```python
-# Standard detection evaluation settings
-eval_config = dict(
-    # Detection settings
-    class_range={
-        'car': 50,                    # meters (max range for evaluation)
-        'truck': 50,
-        'bus': 50,
-        'trailer': 50,
-        'construction_vehicle': 50,
-        'pedestrian': 40,
-        'motorcycle': 40,
-        'bicycle': 40,
-        'barrier': 30,
-        'traffic_cone': 30,
-    },
-    # Distance thresholds for matching
-    dist_fcn='center_distance',
-    dist_ths=[0.5, 1.0, 2.0, 4.0],
-    dist_th_tp=2.0,
-    
-    # Minimum annotation criteria
-    min_recall=0.1,
-    min_precision=0.1,
-    max_boxes_per_sample=500,
-    
-    # Velocity evaluation
-    max_velocity_error=10.0,  # Cap velocity error at 10 m/s
-)
+```
+Is the problem DETECTION (low mAP) or QUALITY (high TP errors)?
+
+Low mAP (< 0.35):
+  |-- Check recall: are objects being missed?
+  |     |-- Yes: backbone features may be poor (check pretrained weights)
+  |     |-- Yes at distance: BEV resolution too low
+  |     +-- Yes for rare classes: enable CBGS
+  |-- Check precision: too many false positives?
+  |     |-- Yes: model overconfident (lower LR, more training)
+  |     +-- Yes in specific regions: check calibration
+
+High mATE (> 0.8):
+  |-- Check calibration matrices (are they correct for your data?)
+  |-- Check BEV resolution (100x100 has 1m quantization error)
+  |-- Check backbone (stronger backbone = better features = better depth)
+  +-- Distance analysis: if only far objects, this is expected behavior
+
+High mAVE (> 0.6):
+  |-- Is temporal fusion enabled? (check video_test_mode=True)
+  |-- Is can_bus data loaded? (check data pipeline)
+  |-- Is ego-motion computation correct? (check coordinate transforms)
+  +-- Is queue_length >= 2? (need at least 1 previous frame)
+
+High mAOE (> 0.5):
+  |-- Objects with ambiguous front/back (common for trucks from behind)
+  |-- Check sin/cos regression -- is loss converging?
+  +-- May need more training epochs for orientation to converge
 ```
 
-### 9.2 Post-Processing Parameters
+### 10.2 Quick Sanity Checks
 
 ```python
-# Test-time post-processing
-test_cfg = dict(
-    pts=dict(
-        score_threshold=0.0,      # Keep all predictions for evaluation
-        max_per_sample=300,       # Maximum predictions per frame
-        nms_type=None,            # No NMS (DETR-style)
-        # Alternative with NMS:
-        # nms_type='circle',
-        # nms_thr=[4.0, ...],    # Per-class NMS thresholds
-    )
-)
+# 1. Verify predictions are in correct range
+# cx, cy should be in [-51.2, 51.2], NOT normalized [0, 1]
+# velocities should be in m/s (typical: -20 to 20), NOT km/h
+
+# 2. Check score distribution
+# If all scores > 0.9: model is overconfident (reduce confidence)
+# If all scores < 0.1: model is underconfident (might need training)
+
+# 3. Verify temporal pairs
+# Print prev/next tokens -- if all "None", temporal is broken
 ```
 
 ---
 
-## 10. Reproducing Published Results
+## 11. Benchmark Comparison
 
-### 10.1 Exact Reproduction Steps
+### 11.1 Camera-Only Methods (nuScenes Test Set, as of 2023)
 
-```bash
-# Step 1: Environment (exact versions)
-pip install torch==2.0.1+cu118
-pip install mmcv-full==1.7.1
-pip install mmdet==2.28.2
-pip install mmdet3d==1.0.0rc6
+| Method | Year | Backbone | NDS | mAP | mAVE | Key Innovation |
+|--------|------|----------|-----|-----|------|----------------|
+| FCOS3D | 2021 | R101 | 0.428 | 0.358 | 1.434 | Per-image monocular |
+| DETR3D | 2022 | V2-99 | 0.479 | 0.412 | 0.845 | 3D reference points |
+| PETR | 2022 | V2-99 | 0.504 | 0.441 | 0.808 | 3D position embedding |
+| BEVDet4D | 2022 | Swin-B | 0.515 | 0.421 | 0.556 | Depth + temporal |
+| **BEVFormer** | **2022** | **R101-DCN** | **0.569** | **0.481** | **0.378** | **Attn BEV + temporal** |
+| **BEVFormer** | **2022** | **V2-99** | **0.592** | **0.517** | **0.322** | **Larger backbone** |
+| StreamPETR | 2023 | V2-99 | 0.592 | 0.504 | 0.283 | PETR + streaming temporal |
+| SOLOFusion | 2023 | R101-DCN | 0.582 | 0.483 | 0.246 | Long-term temporal |
 
-# Step 2: Pretrained backbone
-mkdir ckpts
-wget -O ckpts/r101_dcn_fcos3d_pretrain.pth \
-    <pretrained_model_url>
+### 11.2 Historical Context
 
-# Step 3: Data preparation (see data preparation section)
-python tools/create_data.py nuscenes ...
+BEVFormer was published in 2022 and was the top camera-only method at that time. By 2023, several methods (StreamPETR, SOLOFusion, Far3D) matched or slightly exceeded it, often by building on BEVFormer's insights (temporal fusion, BEV representation). BEVFormer remains historically significant as the method that proved attention-based BEV construction works.
 
-# Step 4: Training
-./tools/dist_train.sh \
-    projects/configs/bevformer/bevformer_base.py 8
+### 11.3 Gap to LiDAR
 
-# Step 5: Evaluation
-./tools/dist_test.sh \
-    projects/configs/bevformer/bevformer_base.py \
-    work_dirs/bevformer_base/epoch_24.pth 8 --eval bbox
-```
+| Method | Sensor | NDS | Gap |
+|--------|--------|-----|-----|
+| BEVFormer-Large | Camera | 0.592 | baseline |
+| CenterPoint | LiDAR | 0.673 | +8.1 |
+| TransFusion-L | LiDAR | 0.702 | +11.0 |
+| BEVFusion | Camera+LiDAR | 0.714 | +12.2 |
 
-### 10.2 Expected Validation Results (with tolerance)
+The camera-to-LiDAR gap is primarily in: (a) long-range detection (>50m), (b) precise localization (mATE), and (c) adverse weather robustness.
 
-| Metric | Expected | Acceptable Range |
-|--------|----------|-----------------|
-| NDS | 0.517 | 0.512 - 0.522 |
-| mAP | 0.416 | 0.411 - 0.421 |
-| mATE | 0.673 | 0.660 - 0.690 |
-| mASE | 0.274 | 0.268 - 0.280 |
-| mAOE | 0.372 | 0.360 - 0.385 |
-| mAVE | 0.394 | 0.380 - 0.410 |
-| mAAE | 0.198 | 0.185 - 0.210 |
+---
 
-### 10.3 Common Reproduction Issues
+## 12. Reproducing Published Results
+
+### 12.1 Expected Results with Tolerance
+
+| Metric | Expected | Acceptable Range | Outside Range? |
+|--------|----------|-----------------|----------------|
+| NDS | 0.517 | 0.512 - 0.522 | Check pretrained weights |
+| mAP | 0.416 | 0.411 - 0.421 | Check training schedule |
+| mATE | 0.673 | 0.660 - 0.690 | Check BEV resolution |
+| mAVE | 0.394 | 0.380 - 0.410 | Check temporal fusion |
+
+### 12.2 Common Reproduction Issues
 
 | Issue | Symptom | Fix |
 |-------|---------|-----|
 | Wrong backbone pretrain | NDS ~0.48 instead of ~0.52 | Use FCOS3D pretrained weights |
 | Missing can_bus data | mAVE ~0.8 (poor velocity) | Download and extract can_bus |
-| Wrong mmcv version | Deformable attention errors | Use mmcv-full==1.7.1 exactly |
-| Queue length mismatch | No temporal benefit | Ensure queue_length=4 in config |
-| Seed difference | ±0.5 NDS variation | Run 3 seeds, report mean |
+| queue_length=1 | No temporal benefit | Set queue_length=4 |
+| Wrong mmcv version | CUDA kernel errors | Use mmcv-full==1.7.1 exactly |
+| Random seed variation | +/- 0.5 NDS | Run 3 seeds, report mean |
+
+---
+
+## 13. Evaluation Configuration Reference
+
+### 13.1 Class Evaluation Ranges
+
+```python
+# Maximum range for evaluating each class
+class_range = {
+    'car': 50,              # meters
+    'truck': 50,
+    'bus': 50,
+    'trailer': 50,
+    'construction_vehicle': 50,
+    'pedestrian': 40,       # shorter range (smaller objects)
+    'motorcycle': 40,
+    'bicycle': 40,
+    'barrier': 30,          # static, typically close
+    'traffic_cone': 30,
+}
+```
+
+### 13.2 Post-Processing for Evaluation
+
+```python
+test_cfg = dict(
+    pts=dict(
+        score_threshold=0.0,    # Keep all for eval (AP computation needs full ranking)
+        max_per_sample=300,     # Max predictions per frame
+        nms_type=None,          # DETR-style: no NMS needed
+    )
+)
+```
+
+Note: For evaluation, keep score_threshold=0.0 so the full precision-recall curve can be computed. For deployment, use score_threshold=0.3 or higher to reduce false positives.

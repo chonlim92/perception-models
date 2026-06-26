@@ -1,389 +1,536 @@
 # StreamMapNet: Model Architecture
 
-## Architecture Overview
+## Overview and Motivation
 
-StreamMapNet follows a modular encoder-decoder architecture with temporal propagation:
+StreamMapNet is an end-to-end neural network that takes **surround-view camera images** as input and produces **vectorized HD map elements** as output. The fundamental challenge it solves is:
+
+> "Given 6 camera images from a car at time t, predict the layout of lanes, road boundaries, and crosswalks in the surrounding 60m x 30m area -- and do this consistently across time."
+
+This requires solving several sub-problems:
+1. **Multi-view fusion**: Combine information from 6 cameras with different viewpoints
+2. **2D-to-3D lifting**: Go from 2D image pixels to a 3D/BEV (Bird's Eye View) representation
+3. **Temporal aggregation**: Accumulate evidence across time as the car moves
+4. **Structured prediction**: Output clean, ordered polylines (not pixels)
+
+---
+
+## Full Pipeline Diagram
 
 ```
-Input: 6 surround-view cameras (3x256x704 each)
-    │
-    ▼
-[1] Image Backbone (ResNet-50 + FPN)
-    │   → Multi-scale features per camera
-    ▼
-[2] BEV Transform (Lift-Splat-Shoot with depth prediction)
-    │   → Bird's-eye-view feature map (C x 200 x 100)
-    ▼
-[3] Temporal Fusion Module
-    │   → Fuse current BEV with warped history
-    ▼
-[4] Map Decoder (Transformer with deformable attention)
-    │   → Decode learnable map queries
-    ▼
-[5] Prediction Heads (Classification + Polyline regression)
-    │   → N queries x (class_logits + K points x 2 coords)
-    ▼
-Output: Vectorized map elements
+ ===============================================================================
+                         StreamMapNet Full Pipeline
+ ===============================================================================
+
+ INPUT: 6 surround-view cameras at time t
+ +-------+  +-------+  +-------+  +-------+  +-------+  +-------+
+ | FRONT |  |FRONT_L|  |FRONT_R|  | BACK  |  |BACK_L |  |BACK_R |
+ +---+---+  +---+---+  +---+---+  +---+---+  +---+---+  +---+---+
+     |           |           |          |           |          |
+     +-----+-----+-----+----+-----+----+-----+----+-----+----+
+           |                       |                      |
+           v                       v                      v
+ STAGE 1:  [=== ResNet-50 Backbone + FPN Neck (shared weights) ===]
+           Input: (B*6, 3, 256, 704)
+           Output: (B*6, 256, 32, 88) multi-scale features
+                              |
+                              v
+ STAGE 2:  [======= Lift-Splat-Shoot BEV Transform =======]
+           (a) Depth prediction: (B*6, 256, 32, 88) -> (B*6, 59, 32, 88)
+           (b) Outer product "Lift": -> (B*6, 256, 59, 32, 88) frustum
+           (c) Voxel pooling "Splat": -> (B, 256, 200, 100) raw BEV
+           (d) BEV encoder: -> (B, 256, 200, 100) refined BEV
+                              |
+                              v
+ STAGE 3:  [========== Temporal Fusion Module ==========]
+           (a) Retrieve hidden state H_{t-1}
+           (b) Warp H_{t-1} to current frame using ego-motion
+           (c) Cross-attention: BEV_t attends to Warped(H_{t-1})
+           (d) Gated fusion -> H_t
+           Input: (B, 256, 200, 100) current + (B, 256, 200, 100) warped history
+           Output: (B, 256, 200, 100) fused BEV features
+                              |
+                              +--------> Store H_t for next frame
+                              |
+                              v
+ STAGE 4:  [====== Map Element Transformer Decoder ======]
+           (a) Learnable queries: (B, 150, 256) -- one per potential element
+           (b) Self-attention among queries (avoid duplicates)
+           (c) Cross-attention to BEV features (find map elements)
+           (d) 6 decoder layers with iterative refinement
+           Output: (B, 150, 256) decoded query embeddings
+                              |
+                              v
+ STAGE 5:  [========== Prediction Heads ==========]
+           Classification: (B, 150, 256) -> (B, 150, 4)  [3 classes + background]
+           Point Regression: (B, 150, 256) -> (B, 150, 20, 2) [20 points x (x,y)]
+                              |
+                              v
+ OUTPUT:   Set of vectorized map elements
+           Each element = class_label + 20 ordered (x, y) points in [0, 1]
+           Denormalized: points map to [-30m, +30m] x [-15m, +15m]
+
+ ===============================================================================
 ```
 
 ---
 
-## Stage 1: Image Backbone
+## Stage 1: Image Backbone (ResNet-50 + FPN)
 
-### Architecture: ResNet-50 + FPN
+### Why We Need Multi-Scale Features
 
-**Input:** 6 camera images, each of size (3, 256, 704) after resize and normalization.  
-Batch dimension: (B, 6, 3, 256, 704) reshaped to (B*6, 3, 256, 704) for backbone processing.
+Camera images contain map elements at various scales:
+- A nearby lane divider occupies many pixels (large scale)
+- A distant pedestrian crossing is just a few pixels (small scale)
+- Road boundaries extend across the entire image
 
-### ResNet-50 Layers
+Multi-scale features let the model "see" at different resolutions simultaneously.
 
-| Layer | Output Size | Channels | Notes |
-|-------|-------------|----------|-------|
-| Stem (conv1 + pool) | 64 x 176 | 64 | 7x7 conv, stride 2, + 3x3 maxpool |
-| Layer 1 (C2) | 64 x 176 | 256 | 3 bottleneck blocks |
-| Layer 2 (C3) | 32 x 88 | 512 | 4 bottleneck blocks, stride 2 |
-| Layer 3 (C4) | 16 x 44 | 1024 | 6 bottleneck blocks, stride 2 |
-| Layer 4 (C5) | 8 x 22 | 2048 | 3 bottleneck blocks, stride 2 |
+### ResNet-50 Backbone
+
+ResNet-50 is a convolutional network pretrained on ImageNet. It processes each camera image independently (shared weights across all 6 cameras):
+
+```
+Input: (B*6, 3, 256, 704) -- all 6 cameras flattened into batch dimension
+
+Stem (conv 7x7, stride 2, maxpool):  (B*6, 64,  64, 176)
+Layer 1 (C2, 3 bottleneck blocks):   (B*6, 256, 64, 176)  stride 4
+Layer 2 (C3, 4 bottleneck blocks):   (B*6, 512, 32, 88)   stride 8
+Layer 3 (C4, 6 bottleneck blocks):   (B*6, 1024, 16, 44)  stride 16
+Layer 4 (C5, 3 bottleneck blocks):   (B*6, 2048, 8, 22)   stride 32
+```
+
+We extract features from layers C3, C4, C5 (out_indices=[1, 2, 3]).
+
+**Frozen stages**: Layer 1 is frozen (no gradient updates) because early features (edges, textures) are well-captured by ImageNet pretraining. This saves memory and prevents overfitting.
 
 ### Feature Pyramid Network (FPN)
 
-FPN produces multi-scale features with uniform channel dimension (C=256):
+FPN combines multi-scale features through a top-down pathway with lateral connections:
 
-| FPN Level | Source | Output Size | Channels |
-|-----------|--------|-------------|----------|
-| P2 | C2 + upsampled P3 | 64 x 176 | 256 |
-| P3 | C3 + upsampled P4 | 32 x 88 | 256 |
-| P4 | C4 + upsampled P5 | 16 x 44 | 256 |
-| P5 | C5 | 8 x 22 | 256 |
+```
+                 Top-Down Pathway
+                 ================
 
-**Used for BEV transform:** Typically P3 and P4 (or just P4 depending on configuration).
+C5 (2048, 8, 22) ---[1x1 conv]---> P5 (256, 8, 22)
+                                        |
+                                    [upsample 2x]
+                                        |
+C4 (1024, 16, 44) --[1x1 conv]--> + --> P4 (256, 16, 44)  <-- [3x3 conv]
+                                        |
+                                    [upsample 2x]
+                                        |
+C3 (512, 32, 88) ---[1x1 conv]--> + --> P3 (256, 32, 88)  <-- [3x3 conv]
 
-**Output per camera:** Feature maps at selected scales, e.g., (256, 16, 44) from P4.  
-**Total backbone output:** (B*6, 256, 16, 44) for the selected FPN level.
+Output: [P3, P4, P5] each with 256 channels
+Primary level for BEV: P3 (256, 32, 88)
+```
+
+**Why FPN?** Without it, high-level features (C5) have good semantics but poor spatial resolution. FPN propagates high-level semantics back to high-resolution levels through the top-down pathway.
 
 ---
 
 ## Stage 2: BEV Transform (Lift-Splat-Shoot)
 
-### Overview
+### The Fundamental Challenge
 
-The Lift-Splat-Shoot (LSS) module transforms perspective camera features into a unified bird's-eye-view (BEV) representation by predicting depth distributions and projecting features into 3D space.
+Cameras produce 2D images, but the map lives in 3D space (or rather, on the 2D ground plane in BEV). The core question:
 
-### Step 2a: Depth Prediction
+> "For each pixel in the image, WHERE in 3D space does it correspond to?"
 
-For each pixel in the feature map, predict a categorical depth distribution over D discrete depth bins:
+This is ambiguous because a single pixel could correspond to any point along its ray. LSS resolves this by predicting a probability distribution over depth.
+
+### Step 2a: Depth Distribution Prediction
+
+For each pixel in the feature map, predict WHERE along its camera ray the content is located:
 
 ```
-Depth network: Conv2d(256, D) where D = number of depth bins
+Input:  (B*6, 256, 32, 88) -- image features (one level from FPN)
+        
+DepthNet: Conv2d(256, 256, 3x3) -> BN -> ReLU -> Conv2d(256, 59, 1x1) -> Softmax
+
+Output: (B*6, 59, 32, 88) -- probability over 59 depth bins
 ```
 
-| Parameter | Value |
-|-----------|-------|
-| Depth range | [2.0m, 50.0m] |
-| Number of bins (D) | 48 |
-| Bin spacing | Uniform (1.0m per bin) |
-| Activation | Softmax over depth dimension |
+Each of the 59 bins represents a 1-meter interval from 1m to 60m.
 
-**Input:** (B*6, 256, 16, 44) image features  
-**Output:** (B*6, D, 16, 44) depth probability distribution
+**Why categorical (softmax) instead of regressing a single depth?**
 
-### Step 2b: Outer Product (Lift)
+A single pixel might be at the boundary of two surfaces (e.g., road at 10m and a building at 30m). A categorical distribution can express this multi-modal uncertainty. Regression would average to 20m -- which is wrong for both surfaces.
 
-Create a depth-aware 3D feature volume by taking the outer product of image features and depth probabilities:
+```
+Example depth distribution for one pixel:
 
-```python
-# context_features: (B*6, C, H_feat, W_feat) = (B*6, 64, 16, 44)
-# depth_probs: (B*6, D, H_feat, W_feat) = (B*6, 48, 16, 44)
+Depth (m):  1  2  3  4  5  6  7  8  9  10 11 12 ... 59
+Prob:       .  .  .  .  .  .  .  .  .  ##  .  .  ...  .
+                                        ^
+                                   Road surface at ~10m
 
-# Outer product creates frustum features
-frustum_features = context_features.unsqueeze(2) * depth_probs.unsqueeze(1)
-# Result: (B*6, C, D, H_feat, W_feat) = (B*6, 64, 48, 16, 44)
+Another pixel (boundary):
+Depth (m):  1  2  3  4  5  6  7  8  9  10 11 12 ... 30 31 ... 59
+Prob:       .  .  .  .  .  .  .  .  .  #  .  .  ... #  .  ...  .
+                                       ^              ^
+                                   Road 10m      Building 30m
 ```
 
-Note: A separate context network reduces channels from 256 to 64 (C_context) before the outer product to manage memory.
+### Step 2b: The "Lift" -- Creating Frustum Features
 
-### Step 2c: Splat to BEV Grid
+The outer product of image features and depth probabilities creates a 3D feature volume:
 
-Project the 3D frustum features onto the BEV plane using camera calibration:
+```
+context_features: (B*6, C, H, W) = (B*6, 256, 32, 88)
+   |
+   |  [Reduce channels: Conv2d(256, 64)]
+   v
+reduced_features: (B*6, 64, 32, 88)
 
-1. **Create frustum point cloud:** For each (u, v, d) in the frustum, compute the 3D point in ego frame using camera intrinsics and extrinsics.
+depth_probs: (B*6, 59, 32, 88)
 
-2. **Voxelize:** Assign each 3D point to a BEV grid cell based on its (x, y) position.
-
-3. **Pool:** Sum all features that fall into the same BEV grid cell (pillar pooling).
-
-```python
-# BEV grid parameters
-BEV_X_RANGE = [-30.0, 30.0]   # meters, 60m total
-BEV_Y_RANGE = [-15.0, 15.0]   # meters, 30m total
-BEV_RESOLUTION = 0.3           # meters per pixel
-BEV_H = 200                    # 60.0 / 0.3 = 200 pixels (longitudinal)
-BEV_W = 100                    # 30.0 / 0.3 = 100 pixels (lateral)
+Outer product (broadcast multiply):
+   reduced_features: (B*6, 64,  1, 32, 88)  -- add depth dim
+   depth_probs:      (B*6,  1, 59, 32, 88)  -- add channel dim
+                     -------------------------
+   frustum_features: (B*6, 64, 59, 32, 88)  -- 3D feature volume!
 ```
 
-**Output:** (B, C_bev, 200, 100) where C_bev = 64
+**Intuition**: Each pixel now becomes a column of 59 points in 3D space. The depth probability tells us how much "weight" to assign to each depth. If the network is confident a pixel is at 10m, that depth slice gets high weight.
+
+### Step 2c: The "Splat" -- Voxel Pooling to BEV
+
+Now we project each frustum point into ego-vehicle 3D coordinates and accumulate into a BEV grid:
+
+```
+For each point (u, v, d) in the frustum:
+  1. Unproject to camera coordinates:
+     X_cam = (u - cx) * d / fx
+     Y_cam = (v - cy) * d / fy
+     Z_cam = d
+     
+  2. Transform to ego coordinates using extrinsics (cam-to-ego):
+     [X_ego]         [X_cam]
+     [Y_ego] = R *   [Y_cam]  + T
+     [Z_ego]         [Z_cam]
+     
+  3. Assign to BEV grid cell:
+     grid_x = floor((X_ego - x_min) / resolution)
+     grid_y = floor((Y_ego - y_min) / resolution)
+     
+  4. Add weighted features to that grid cell
+```
+
+The BEV grid parameters:
+```
+X range: [-30.0m, +30.0m]  (60m forward/backward)
+Y range: [-15.0m, +15.0m]  (30m left/right)
+Resolution: 0.3m per cell
+Grid size: 200 cells (X) x 100 cells (Y)
+```
+
+**Pooling**: Multiple points from multiple cameras may land in the same BEV cell. We sum their features (scatter_add). This naturally handles overlap between cameras.
+
+```
+Output after splatting: (B, 64, 200, 100) -- raw BEV feature map
+```
 
 ### Step 2d: BEV Encoder
 
-Optional convolutional encoder to refine the raw BEV features:
+A small CNN refines the raw BEV features:
 
-```python
-BEVEncoder = nn.Sequential(
-    ResBlock(64, 128, stride=2),   # (B, 128, 100, 50)
-    ResBlock(128, 256, stride=2),  # (B, 256, 50, 25)
-)
-# Then upsample back:
-BEVNeck = nn.Sequential(
-    Upsample(256, 128),            # (B, 128, 100, 50)
-    Upsample(128, 256),            # (B, 256, 200, 100)
-)
+```
+Input:  (B, 64, 200, 100)
+Conv3x3 + BN + ReLU: (B, 256, 200, 100)
+Conv3x3 + BN + ReLU: (B, 256, 200, 100)
+Output: (B, 256, 200, 100) -- final BEV features
 ```
 
-**Final BEV features:** (B, 256, 200, 100)
+This smooths out noise from the discrete voxel pooling and increases the channel dimension for richer representations.
+
+### Complete LSS Tensor Flow
+
+| Step | Input Shape | Output Shape | Operation |
+|------|------------|--------------|-----------|
+| FPN features | - | (B*6, 256, 32, 88) | From backbone |
+| Depth prediction | (B*6, 256, 32, 88) | (B*6, 59, 32, 88) | DepthNet + softmax |
+| Channel reduction | (B*6, 256, 32, 88) | (B*6, 64, 32, 88) | Conv2d 1x1 |
+| Outer product (Lift) | 64-ch + 59-depth | (B*6, 64, 59, 32, 88) | Broadcast multiply |
+| Splat to BEV | (B*6, 64, 59, 32, 88) | (B, 64, 200, 100) | Voxel pool (scatter_add) |
+| BEV Encoder | (B, 64, 200, 100) | (B, 256, 200, 100) | 2x Conv3x3+BN+ReLU |
 
 ---
 
 ## Stage 3: Temporal Fusion Module
 
-### Overview
+### Why Past Frames Help
 
-The temporal fusion module incorporates information from previous frames by:
-1. Warping the previous frame's hidden state to the current coordinate frame using ego-motion
-2. Fusing the warped history with current BEV features
+Consider a car driving forward. At time t, the front cameras see what is ahead. At time t+1, the car has moved forward by ~0.5m. Now:
+- What was previously at the edge of the front camera's view is now centered
+- The rear cameras now see road that was behind us
+- Occluded areas may become visible from the new angle
+
+By accumulating observations across time, the model builds a MORE COMPLETE map:
+
+```
+Time t:   Car sees road ahead, but lane dividers are partially occluded by a truck
+Time t+1: Car has moved; truck is now at a different angle; dividers partly visible
+Time t+2: Car passed the truck; dividers fully visible from behind
+
+Single-frame at t: Can't see dividers -> MISSES THEM
+StreamMapNet at t: Has accumulated info from t-1, t-2, ... -> DETECTS THEM
+```
+
+### The Streaming Hidden State
+
+StreamMapNet maintains a hidden state H_t that encodes all useful information from past frames. This is analogous to an RNN:
+
+```
+               Temporal Information Flow
+               =========================
+
+Frame t-2:  BEV_{t-2} -----> H_{t-2}
+                                |
+                          [ego-motion warp]
+                                |
+                                v
+Frame t-1:  BEV_{t-1} ---[fuse]--> H_{t-1}
+                                     |
+                               [ego-motion warp]
+                                     |
+                                     v
+Frame t:    BEV_t --------[fuse]-------> H_t -----> Decoder -> Map Output
+                                          |
+                                    [stored for t+1]
+```
+
+**Key insight**: We never re-process past images. We only carry forward ONE hidden state tensor, regardless of how many frames have passed. This gives O(1) cost per frame.
 
 ### Step 3a: Ego-Motion Warping
 
-Given the relative pose transformation from frame t-1 to frame t:
+When the car moves from time t-1 to time t, the BEV features from t-1 are now in the wrong coordinate frame. We must spatially align them.
 
-```python
-def generate_warp_grid(ego_motion_matrix, bev_h, bev_w, bev_range):
-    """
-    Generate sampling grid for warping previous BEV to current frame.
-    
-    Args:
-        ego_motion_matrix: (B, 4, 4) transformation from current to previous
-        bev_h, bev_w: spatial dimensions of BEV grid (200, 100)
-        bev_range: [x_min, y_min, x_max, y_max] = [-30, -15, 30, 15]
-    
-    Returns:
-        grid: (B, bev_h, bev_w, 2) normalized sampling coordinates
-    """
-    # Create BEV coordinate meshgrid
-    x = torch.linspace(bev_range[0], bev_range[2], bev_w)  # [-30, 30]
-    y = torch.linspace(bev_range[1], bev_range[3], bev_h)  # [-15, 15]
-    yy, xx = torch.meshgrid(y, x, indexing='ij')
-    
-    # Current frame BEV points (homogeneous)
-    ones = torch.ones_like(xx)
-    zeros = torch.zeros_like(xx)
-    points_curr = torch.stack([xx, yy, zeros, ones], dim=-1)  # (H, W, 4)
-    
-    # Transform to previous frame coordinates
-    points_prev = torch.einsum('bij,hwj->bhwi', ego_motion_matrix, points_curr)
-    
-    # Normalize to [-1, 1] for grid_sample
-    grid_x = (points_prev[..., 0] - bev_range[0]) / (bev_range[2] - bev_range[0]) * 2 - 1
-    grid_y = (points_prev[..., 1] - bev_range[1]) / (bev_range[3] - bev_range[1]) * 2 - 1
-    
-    grid = torch.stack([grid_x, grid_y], dim=-1)  # (B, H, W, 2)
-    return grid
+**The math**:
+
+Given ego-motion matrix T_{prev_to_curr} (4x4 rigid body transformation):
+
+```
+T = [R  t]     R = 3x3 rotation
+    [0  1]     t = 3x1 translation
+
+For a BEV grid point p_curr = (x, y, 0, 1) in the current frame,
+we want to find where it was in the previous frame:
+
+p_prev = T_curr_to_prev @ p_curr = T_prev_to_curr^{-1} @ p_curr
 ```
 
-```python
-# Apply warping
-warp_grid = generate_warp_grid(ego_motion, BEV_H, BEV_W, BEV_RANGE)
-H_warped = F.grid_sample(
-    H_prev,           # (B, C, 200, 100) previous hidden state
-    warp_grid,        # (B, 200, 100, 2) sampling coordinates
-    mode='bilinear',
-    padding_mode='zeros',  # Out-of-range areas get zero features
-    align_corners=True
-)
-# H_warped: (B, C, 200, 100) - previous features aligned to current frame
-```
-
-### Step 3b: Temporal Attention Fusion
-
-The primary fusion mechanism uses cross-attention:
+**Implementation**:
 
 ```python
-class TemporalFusionModule(nn.Module):
-    def __init__(self, embed_dim=256, num_heads=8):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.ReLU(),
-            nn.Linear(embed_dim * 4, embed_dim),
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.Sigmoid(),
-        )
-    
-    def forward(self, bev_current, h_warped):
-        """
-        Args:
-            bev_current: (B, C, H, W) current BEV features
-            h_warped: (B, C, H, W) warped previous hidden state
-        
-        Returns:
-            h_new: (B, C, H, W) fused hidden state
-        """
-        B, C, H, W = bev_current.shape
-        
-        # Flatten spatial dims for attention
-        q = bev_current.flatten(2).permute(0, 2, 1)  # (B, HW, C)
-        kv = h_warped.flatten(2).permute(0, 2, 1)    # (B, HW, C)
-        
-        # Cross-attention: current queries attend to history
-        attn_out, _ = self.cross_attn(q, kv, kv)
-        q = self.norm1(q + attn_out)
-        q = self.norm2(q + self.ffn(q))
-        
-        # Gated fusion with current BEV
-        bev_flat = bev_current.flatten(2).permute(0, 2, 1)
-        gate_input = torch.cat([q, bev_flat], dim=-1)
-        gate_weight = self.gate(gate_input)  # (B, HW, C)
-        
-        h_new = gate_weight * q + (1 - gate_weight) * bev_flat
-        h_new = h_new.permute(0, 2, 1).reshape(B, C, H, W)
-        
-        return h_new
+# 1. Create grid of BEV coordinates in current frame
+xs = linspace(-30, +30, 200)  # 200 cells, x-axis
+ys = linspace(-15, +15, 100)  # 100 cells, y-axis
+grid = meshgrid(ys, xs)       # (100, 200, 2) in meters
+
+# 2. Apply inverse ego-motion to find corresponding previous-frame locations
+grid_homo = [grid_x, grid_y, 0, 1]          # homogeneous coords
+grid_prev = T_inv @ grid_homo               # where each cell WAS
+
+# 3. Normalize to [-1, 1] for grid_sample
+norm_x = (grid_prev_x - x_min) / (x_max - x_min) * 2 - 1
+norm_y = (grid_prev_y - y_min) / (y_max - y_min) * 2 - 1
+
+# 4. Sample previous features at those locations
+warped = F.grid_sample(H_prev, grid, mode='bilinear', padding_mode='zeros')
 ```
 
-### Tensor Dimensions Through Temporal Fusion
+**Zero padding**: Areas that are "new" (the car moved, revealing previously unseen road) get zero features -- the model has no information there yet.
+
+```
+Example: Car moves 1m forward
+
+  Previous BEV:              Current BEV after warping:
+  +------------------+       +------------------+
+  |  History info    |       | zeros (new area) |  <- car moved into new area
+  |  about road     |       +------------------+
+  |  behind us      |       |  History info    |
+  |                  |       |  about road     |
+  +------------------+       |  (shifted back) |
+                             +------------------+
+```
+
+### Step 3b: Cross-Attention Fusion
+
+After warping, we fuse current observations with warped history:
+
+```python
+# Flatten spatial dimensions for attention
+current_flat = current_bev.flatten(2).permute(0, 2, 1)  # (B, 20000, 256)
+warped_flat  = warped_prev.flatten(2).permute(0, 2, 1)  # (B, 20000, 256)
+
+# Cross-attention: "What useful information does the past provide?"
+# Query = current frame (what do I need?)
+# Key/Value = warped past (what can the past offer?)
+Q = query_proj(current_flat)   # (B, 20000, 256)
+K = key_proj(warped_flat)      # (B, 20000, 256)
+V = value_proj(warped_flat)    # (B, 20000, 256)
+
+attention_weights = softmax(Q @ K^T / sqrt(d))  # (B, 20000, 20000)
+attn_output = attention_weights @ V              # (B, 20000, 256)
+
+# Residual + FFN
+fused = LayerNorm(current_flat + attn_output)
+fused = LayerNorm(fused + FFN(fused))
+```
+
+### Step 3c: Gated Fusion
+
+A learnable gate controls how much temporal information to incorporate at each spatial location:
+
+```python
+# Gate: per-location blend between current and fused
+gate_input = concat([current_flat, fused], dim=-1)  # (B, 20000, 512)
+gate_weight = sigmoid(Linear(gate_input))            # (B, 20000, 256) in [0, 1]
+
+# Blend: gate=1 means use fused (temporal), gate=0 means use current only
+output = gate_weight * fused + (1 - gate_weight) * current_flat
+```
+
+**Why gating?** Some areas benefit from temporal info (persistent road structure), while others should rely only on current observation (moving objects, areas with high ego-motion blur). The gate learns this automatically.
+
+### Temporal Tensor Dimensions
 
 | Tensor | Shape | Description |
 |--------|-------|-------------|
-| BEV_current | (B, 256, 200, 100) | Current frame BEV features |
-| H_prev | (B, 256, 200, 100) | Previous hidden state (stored) |
-| ego_motion | (B, 4, 4) | Current-to-previous transform |
-| warp_grid | (B, 200, 100, 2) | Sampling grid |
-| H_warped | (B, 256, 200, 100) | Warped previous state |
-| H_new | (B, 256, 200, 100) | Fused hidden state (output) |
+| current_bev | (B, 256, 200, 100) | Fresh BEV from current cameras |
+| H_prev | (B, 256, 200, 100) | Stored hidden state from previous frame |
+| ego_motion | (B, 4, 4) | prev-to-current transformation |
+| T_inv | (B, 4, 4) | current-to-previous (for warping) |
+| warp_grid | (B, 100, 200, 2) | Sampling coordinates |
+| warped_prev | (B, 256, 200, 100) | Previous state in current coords |
+| fused_bev (H_t) | (B, 256, 200, 100) | Output = new hidden state |
+
+### Multi-Frame Extension
+
+For temporal_window > 1, the module maintains a buffer of N previous states:
+
+```
+Buffer = [H_{t-3}, H_{t-2}, H_{t-1}]  (for window=3)
+
+Each frame is independently warped to current coordinates:
+  warped_3 = warp(H_{t-3}, T_{t-3 to t})
+  warped_2 = warp(H_{t-2}, T_{t-2 to t})
+  warped_1 = warp(H_{t-1}, T_{t-1 to t})
+
+Sequential fusion: oldest to newest:
+  fused = cross_attn(current_bev, warped_3)
+  fused = cross_attn(fused, warped_2)
+  fused = cross_attn(fused, warped_1)
+
+Additional channel concatenation + 1x1 conv for richer aggregation.
+```
 
 ---
 
-## Stage 4: Map Decoder (Transformer)
+## Stage 4: Map Element Decoder (Transformer)
 
-### Architecture: DETR-style Decoder with Deformable Attention
+### What Are Map Queries?
 
-The map decoder uses learnable queries to detect and localize map elements in the BEV feature map.
+Map queries are learnable embeddings -- vectors that the network optimizes during training. Each query "learns" to detect one map element:
 
-### Learnable Map Queries
-
-```python
-# Query initialization
-num_queries = 50        # Number of map element queries (adjustable, typically 50-120)
-query_dim = 256         # Query embedding dimension
-num_points = 20         # Points per polyline (K)
-
-map_queries = nn.Embedding(num_queries, query_dim)  # Learnable query embeddings
-reference_points = nn.Linear(query_dim, num_points * 2)  # Initial reference points
 ```
+query_embeddings = nn.Embedding(150, 256)  # 150 learnable 256-dim vectors
+
+# After training, different queries specialize:
+# Query 0-49:  tend to detect lane dividers
+# Query 50-99: tend to detect road boundaries  
+# Query 100-149: tend to detect pedestrian crossings
+```
+
+**Analogy**: Think of each query as a "detector agent" that roams the BEV looking for its assigned type of map element. Through self-attention, agents communicate to avoid detecting the same element twice.
 
 ### Decoder Layer Structure
 
-Each decoder layer contains:
+Each of the 6 decoder layers performs:
 
-```python
-class MapDecoderLayer(nn.Module):
-    def __init__(self, d_model=256, nhead=8, num_levels=1, num_points_attn=4):
-        super().__init__()
-        # Self-attention among queries
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_model)
-        
-        # Deformable cross-attention to BEV features
-        self.cross_attn = DeformableAttention(
-            d_model=d_model,
-            n_heads=nhead,
-            n_levels=num_levels,
-            n_points=num_points_attn,  # sampling points per attention head
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        
-        # Feed-forward network
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(0.1),
-        )
-        self.norm3 = nn.LayerNorm(d_model)
-    
-    def forward(self, queries, bev_features, reference_points):
-        """
-        Args:
-            queries: (B, N_queries, C) = (B, 50, 256)
-            bev_features: (B, C, H, W) = (B, 256, 200, 100)
-            reference_points: (B, N_queries, K, 2) = (B, 50, 20, 2)
-        """
-        # Self-attention
-        q = self.norm1(queries + self.self_attn(queries, queries, queries)[0])
-        
-        # Deformable cross-attention to BEV
-        q = self.norm2(q + self.cross_attn(q, bev_features, reference_points))
-        
-        # FFN
-        q = self.norm3(q + self.ffn(q))
-        
-        return q
+```
+Input: queries (B, 150, 256) + BEV memory (B, 20000, 256)
+
+(1) Self-Attention (queries talk to each other):
+    "Is anyone else detecting the same lane divider I found?"
+    queries = LayerNorm(queries + SelfAttn(queries, queries, queries))
+
+(2) Cross-Attention (queries look at BEV features):
+    "Where in the BEV are my map elements?"
+    queries = LayerNorm(queries + CrossAttn(queries, BEV, BEV))
+
+(3) Feed-Forward Network:
+    queries = LayerNorm(queries + FFN(queries))
+
+Output: queries (B, 150, 256) -- refined
 ```
 
-### Deformable Attention Details
+### Cross-Attention to BEV Features
 
-Deformable attention samples a small set of key positions around reference points instead of attending to the full BEV feature map:
+This is where queries actually "read" the map content:
 
-```python
-class DeformableAttention(nn.Module):
-    """
-    Multi-scale deformable attention for efficient BEV feature sampling.
-    Instead of attending to all 200x100=20000 BEV positions,
-    samples only n_points positions per query per head.
-    """
-    def __init__(self, d_model=256, n_heads=8, n_levels=1, n_points=4):
-        super().__init__()
-        self.n_heads = n_heads
-        self.n_points = n_points
-        self.n_levels = n_levels
-        
-        # Predict sampling offsets: each head samples n_points per reference point
-        self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
-        self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
-        self.value_proj = nn.Linear(d_model, d_model)
-        self.output_proj = nn.Linear(d_model, d_model)
+```
+                  Cross-Attention Mechanism
+                  ========================
+
+  Queries (150 elements)         BEV Feature Map (200 x 100)
+  +---+---+---+...+---+         +---------------------------+
+  | q1| q2| q3|   |q150|        |  BEV features contain     |
+  +---+---+---+...+---+         |  spatial info about road   |
+       |                         |  structure, lanes, etc.    |
+       | Q = Linear(queries)     +---------------------------+
+       |                              |
+       |     K, V = Linear(BEV)       |
+       |          |                   |
+       +----------+----> Attention ---+
+                         weights
+                           |
+                           v
+                  Weighted sum of BEV features
+                  (each query extracts relevant spatial info)
 ```
 
-### Decoder Stack Configuration
+### Deformable Attention (Efficiency)
 
-| Parameter | Value |
-|-----------|-------|
-| Number of decoder layers | 6 |
-| Hidden dimension | 256 |
-| Number of attention heads | 8 |
-| Deformable attention points | 4 per head |
-| FFN dimension | 1024 |
-| Dropout | 0.1 |
+Full cross-attention to 200x100 = 20,000 BEV positions is expensive (O(N*M) = O(150 * 20000)). Deformable attention samples only a few key positions per query:
 
-### Reference Point Iterative Refinement
-
-After each decoder layer, reference points are refined:
-
-```python
-# In the decoder forward pass:
-for layer_idx, decoder_layer in enumerate(self.decoder_layers):
-    queries = decoder_layer(queries, bev_features, reference_points)
-    
-    # Refine reference points
-    delta_points = self.point_refinement[layer_idx](queries)  # (B, N, K*2)
-    delta_points = delta_points.reshape(B, N, K, 2)
-    reference_points = reference_points + delta_points.sigmoid() * 0.1  # Small refinement
 ```
+Instead of attending to ALL 20,000 positions:
+  Query -> predict 4 sampling offsets per head
+  Sample BEV features at only those 4 positions
+  Weighted average of sampled values
+
+Complexity: O(150 * 4 * 8 heads) = O(4800) instead of O(3,000,000)
+```
+
+### Iterative Reference Point Refinement
+
+Each decoder layer also predicts a small correction to reference points:
+
+```
+Layer 0: Initial reference points (learned, e.g., uniform grid)
+         queries -> predict delta_points -> update reference_points
+
+Layer 1: Refined reference points
+         queries -> predict delta_points -> further refine
+
+...
+
+Layer 5: Final highly-refined reference points = predicted polyline
+```
+
+### Decoder Configuration
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| num_queries | 150 | Max map elements to detect |
+| num_decoder_layers | 6 | Iterative refinement depth |
+| d_model | 256 | Query/key/value dimension |
+| num_heads | 8 | Multi-head attention heads |
+| ffn_dim | 512 | Feed-forward hidden dimension |
+| dropout | 0.1 | Regularization |
+| deformable_points | 4 | Sampling points per head |
 
 ---
 
@@ -391,127 +538,113 @@ for layer_idx, decoder_layer in enumerate(self.decoder_layers):
 
 ### Classification Head
 
+Predicts what class each query represents (or "no object"):
+
 ```python
-class ClassificationHead(nn.Module):
-    def __init__(self, d_model=256, num_classes=3):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, num_classes),
-        )
-    
-    def forward(self, queries):
-        """
-        Args:
-            queries: (B, N_queries, C) = (B, 50, 256)
-        Returns:
-            class_logits: (B, N_queries, num_classes) = (B, 50, 3)
-        """
-        return self.fc(queries)
+ClassHead = Sequential(
+    Linear(256, 256), ReLU(), LayerNorm(256),
+    Linear(256, 4)  # 3 map classes + 1 background
+)
+
+Input:  (B, 150, 256) query embeddings
+Output: (B, 150, 4)   class logits
+                       [lane_div, road_bound, ped_cross, no_object]
 ```
 
 ### Polyline Regression Head
 
+Predicts 20 ordered (x, y) points defining the shape of each map element:
+
 ```python
-class PolylineHead(nn.Module):
-    def __init__(self, d_model=256, num_points=20):
-        super().__init__()
-        self.num_points = num_points
-        self.reg = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, num_points * 2),  # K points x 2 coordinates
-        )
-    
-    def forward(self, queries):
-        """
-        Args:
-            queries: (B, N_queries, C) = (B, 50, 256)
-        Returns:
-            points: (B, N_queries, K, 2) = (B, 50, 20, 2) in normalized coords
-        """
-        output = self.reg(queries)  # (B, 50, 40)
-        output = output.reshape(-1, self.num_points, 2)  # (B*50, 20, 2)
-        output = output.sigmoid()  # Normalize to [0, 1]
-        return output.reshape(-1, queries.shape[1], self.num_points, 2)
+PointHead = Sequential(
+    Linear(256, 256), ReLU(),
+    Linear(256, 20 * 2)  # 20 points x 2 coordinates
+)
+
+Input:  (B, 150, 256) query embeddings
+Output: (B, 150, 40) -> reshape to (B, 150, 20, 2) -> sigmoid to [0, 1]
 ```
 
-### Final Output Format
+**Sigmoid activation**: Forces coordinates into [0, 1] range. During evaluation, these are denormalized:
+```
+x_meters = x_norm * (x_max - x_min) + x_min = x_norm * 60 - 30
+y_meters = y_norm * (y_max - y_min) + y_min = y_norm * 30 - 15
+```
+
+### Deep Supervision (Auxiliary Outputs)
+
+Predictions are generated at EVERY decoder layer (not just the final one):
+
+```
+Layer 0 -> cls_logits_0, pred_points_0  (coarse)
+Layer 1 -> cls_logits_1, pred_points_1
+Layer 2 -> cls_logits_2, pred_points_2
+Layer 3 -> cls_logits_3, pred_points_3
+Layer 4 -> cls_logits_4, pred_points_4
+Layer 5 -> cls_logits_5, pred_points_5  (final, best quality)
+```
+
+All layers contribute to the loss during training. This helps gradient flow to early layers.
+
+---
+
+## Output Format
+
+### Per-Frame Predictions
 
 ```python
-# Model output dictionary
 output = {
-    'class_logits': (B, N_queries, num_classes),  # (B, 50, 3)
-    'pred_points': (B, N_queries, K, 2),          # (B, 50, 20, 2) normalized [0,1]
-    # Auxiliary outputs from intermediate decoder layers (for deep supervision)
-    'aux_outputs': [
-        {'class_logits': ..., 'pred_points': ...},  # Layer 0
-        {'class_logits': ..., 'pred_points': ...},  # Layer 1
-        ...                                          # Layers 2-4
+    'pred_logits': tensor(B, 150, 4),     # Class logits (softmax for probs)
+    'pred_points': tensor(B, 150, 20, 2), # Normalized [0,1] polyline points
+    'aux_outputs': [                       # Intermediate layer outputs
+        {'pred_logits': ..., 'pred_points': ...},  # Layer 0
+        {'pred_logits': ..., 'pred_points': ...},  # Layer 1
+        # ... layers 2-4
     ]
 }
 ```
 
----
+### Post-Processing for Inference
 
-## Complete Tensor Flow Summary
+```python
+# 1. Get class probabilities
+probs = softmax(pred_logits, dim=-1)           # (B, 150, 4)
 
-| Stage | Input Shape | Output Shape | Module |
-|-------|-------------|--------------|--------|
-| Camera input | (B, 6, 3, 256, 704) | - | - |
-| Reshape for backbone | (B*6, 3, 256, 704) | (B*6, 256, 16, 44) | ResNet-50 + FPN (P4) |
-| Depth prediction | (B*6, 256, 16, 44) | (B*6, 48, 16, 44) | Conv2d + Softmax |
-| Context features | (B*6, 256, 16, 44) | (B*6, 64, 16, 44) | Conv2d (channel reduction) |
-| Frustum features (Lift) | (B*6, 64, 16, 44) + depth | (B*6, 64, 48, 16, 44) | Outer product |
-| Splat to BEV | (B*6, 64, 48, 16, 44) | (B, 64, 200, 100) | Voxel pooling |
-| BEV encoder | (B, 64, 200, 100) | (B, 256, 200, 100) | ResNet blocks + neck |
-| Temporal warp | (B, 256, 200, 100) + pose | (B, 256, 200, 100) | grid_sample |
-| Temporal fusion | (B, 256, 200, 100) x2 | (B, 256, 200, 100) | Cross-attention + gate |
-| Map decoder | (B, 50, 256) queries + BEV | (B, 50, 256) | 6x Decoder layers |
-| Classification | (B, 50, 256) | (B, 50, 3) | MLP head |
-| Point regression | (B, 50, 256) | (B, 50, 20, 2) | MLP head + sigmoid |
+# 2. Get predicted class and confidence (exclude background)
+scores, labels = probs[:, :, :3].max(dim=-1)   # (B, 150)
 
----
+# 3. Filter by confidence threshold
+keep = scores > 0.3
 
-## Model Variants
+# 4. Denormalize points to meters
+points_meters = pred_points * [60, 30] + [-30, -15]  # (B, 150, 20, 2)
+```
 
-### Backbone Options
+### What the Output Represents
 
-| Backbone | Params | FLOPs | mAP (nuScenes) |
-|----------|--------|-------|-----------------|
-| ResNet-18 | 11.7M | 1.8G | 48.2 |
-| ResNet-50 | 25.6M | 4.1G | 54.1 |
-| ResNet-101 | 44.5M | 7.8G | 55.8 |
-| Swin-Tiny | 28.3M | 4.5G | 56.2 |
+```
+Example output for one frame:
 
-### BEV Resolution Options
+Element 0: class=lane_divider, score=0.92, points=[(−5.2, −2.1), (−4.8, −1.5), ..., (2.3, 3.4)]
+Element 1: class=road_boundary, score=0.87, points=[(−15.0, −12.3), ..., (−15.0, 12.1)]
+Element 2: class=ped_crossing, score=0.76, points=[(8.1, −3.2), ..., (8.1, 3.2)]
+...
+Element 11: class=lane_divider, score=0.45, points=[...]
+Element 12: class=background, score=0.08 -> DISCARDED (below threshold)
+...
+Element 149: class=background, score=0.02 -> DISCARDED
+```
 
-| Resolution | Grid Size | Memory | mAP |
-|-----------|-----------|--------|-----|
-| 0.15 m/px | 400 x 200 | ~4.2 GB | 55.3 |
-| 0.30 m/px | 200 x 100 | ~1.1 GB | 54.1 |
-| 0.60 m/px | 100 x 50 | ~0.3 GB | 50.8 |
-
-### Number of Queries
-
-| N_queries | mAP | Recall | Notes |
-|-----------|-----|--------|-------|
-| 30 | 52.1 | 78.3% | May miss elements in complex scenes |
-| 50 | 54.1 | 85.7% | Default setting |
-| 100 | 54.3 | 89.1% | Slightly better recall, more compute |
-| 150 | 54.2 | 89.8% | Diminishing returns |
+Typically, a scene has 10-30 actual map elements; the remaining queries predict "background."
 
 ---
 
-## Memory and Compute Budget
+## Memory Footprint and Compute Budget
 
-### Per-frame Inference (B=1, ResNet-50, 200x100 BEV)
+### Per-Frame Inference (B=1, ResNet-50, 200x100 BEV)
 
-| Component | FLOPs | Memory | Time (A100) |
-|-----------|-------|--------|-------------|
+| Component | FLOPs | GPU Memory | Latency (A100) |
+|-----------|-------|------------|----------------|
 | Backbone (6 images) | 24.6G | 1.2 GB | 12 ms |
 | LSS depth + splat | 8.2G | 2.1 GB | 8 ms |
 | BEV encoder | 4.8G | 0.6 GB | 4 ms |
@@ -520,4 +653,72 @@ output = {
 | Prediction heads | 0.1G | <0.1 GB | <1 ms |
 | **Total** | **41.7G** | **4.4 GB** | **~33 ms** |
 
-**Inference speed:** ~30 FPS on NVIDIA A100, ~15 FPS on NVIDIA RTX 3090
+**Inference speed**: ~30 FPS on A100, ~15 FPS on RTX 3090
+
+### Why Streaming is Memory-Efficient
+
+| Approach | Memory for History | Compute for History |
+|----------|-------------------|---------------------|
+| No temporal | 0 | 0 |
+| Re-encode past frames (N=4) | 4 x image features + 4 x BEV | 4x backbone + 4x LSS |
+| BEVFormer (buffer 4 BEVs) | 4 x (256, 200, 100) = 80 MB | Temporal self-attention |
+| **StreamMapNet (1 hidden state)** | **1 x (256, 200, 100) = 20 MB** | **1x warp + 1x cross-attn** |
+
+StreamMapNet stores only ONE tensor of size (256, 200, 100) = 5.12M values = 20 MB in FP32. This is constant regardless of how many frames have been processed.
+
+---
+
+## Model Variants
+
+### Backbone Options
+
+| Backbone | Params | FLOPs (per image) | mAP (nuScenes) |
+|----------|--------|-------------------|-----------------|
+| ResNet-18 | 11.7M | 1.8G | 48.2 |
+| ResNet-50 | 25.6M | 4.1G | 54.1 |
+| ResNet-101 | 44.5M | 7.8G | 55.8 |
+| Swin-Tiny | 28.3M | 4.5G | 56.2 |
+
+### BEV Resolution Options
+
+| Resolution | Grid Size | BEV Memory | mAP |
+|-----------|-----------|------------|-----|
+| 0.15 m/px | 400 x 200 | ~4.2 GB | 55.3 |
+| 0.30 m/px | 200 x 100 | ~1.1 GB | 54.1 |
+| 0.60 m/px | 100 x 50 | ~0.3 GB | 50.8 |
+
+### Query Count Effect
+
+| N_queries | mAP | Recall | Notes |
+|-----------|-----|--------|-------|
+| 30 | 52.1 | 78.3% | May miss elements in complex intersections |
+| 50 | 53.5 | 83.2% | Good for simple roads |
+| 100 | 54.0 | 87.5% | Balanced |
+| 150 | 54.1 | 89.1% | Default, handles complex scenes |
+| 200 | 54.2 | 89.8% | Diminishing returns |
+
+---
+
+## Key Design Decisions Summarized
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| 2D-to-BEV method | LSS (Lift-Splat-Shoot) | Explicit depth reasoning, geometry-aware |
+| Temporal propagation | Streaming hidden state | O(1) compute and memory per frame |
+| Temporal alignment | Ego-motion warping | Accurate spatial alignment via known pose |
+| Temporal fusion | Cross-attention + gate | Selective info retrieval from history |
+| Map decoder | DETR-style transformer | Parallel set prediction, permutation-invariant |
+| Output format | Fixed-point polylines | Fixed K=20 points, simpler than autoregressive |
+| Matching | Hungarian algorithm | Optimal assignment for set prediction loss |
+| Point normalization | Sigmoid to [0,1] | Stable optimization, bounded output |
+
+---
+
+## References
+
+- Philion & Fidler (2020). Lift, Splat, Shoot: Encoding Images from Arbitrary Camera Rigs. ECCV 2020.
+- He et al. (2016). Deep Residual Learning for Image Recognition. CVPR 2016.
+- Lin et al. (2017). Feature Pyramid Networks for Object Detection. CVPR 2017.
+- Carion et al. (2020). End-to-End Object Detection with Transformers (DETR). ECCV 2020.
+- Zhu et al. (2021). Deformable DETR: Deformable Transformers for End-to-End Object Detection. ICLR 2021.
+- Yuan et al. (2024). StreamMapNet: Streaming Mapping Network for Vectorized Online HD Map Construction. WACV 2024.

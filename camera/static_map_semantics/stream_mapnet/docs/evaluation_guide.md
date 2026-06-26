@@ -1,408 +1,618 @@
-# StreamMapNet: Evaluation Guide
+# StreamMapNet: Comprehensive Evaluation Guide
 
-## Overview
-
-StreamMapNet evaluation measures how accurately predicted vectorized map elements match ground truth annotations. The primary metrics are based on Chamfer distance and Average Precision (AP) at multiple distance thresholds.
+A deep-dive reference for engineers who know PyTorch and deep learning but are new to
+autonomous driving map evaluation. This guide teaches every metric from first principles.
 
 ---
 
-## Evaluation Metrics
+## 1. Overview: Why Map Evaluation Is Different from Standard Detection
 
-### 1. Chamfer Distance
+In standard object detection (COCO, VOC), you predict bounding boxes and measure overlap
+(IoU) against ground truth boxes. A box either overlaps enough or it does not.
 
-The Chamfer distance measures the similarity between two point sets (predicted polyline vs. GT polyline). It is computed bidirectionally:
+Vectorized map prediction is fundamentally different:
+
+- **Outputs are polylines and polygons**, not axis-aligned boxes. A lane divider is a
+  sequence of ordered 2D points describing a curve in bird's-eye-view (BEV) space.
+- **There is no notion of "overlap"** between two polylines. Two lines can be close
+  everywhere yet share zero area.
+- **Spatial accuracy is measured in meters**, and those meters have physical safety
+  implications -- a 1-meter error in a lane boundary might steer the vehicle into
+  oncoming traffic.
+- **Temporal consistency matters.** A planning module that receives jittering lane
+  predictions will produce jerky steering commands, even if each individual frame is
+  accurate.
+
+Therefore, the map evaluation stack replaces IoU with Chamfer distance, redefines what
+"correct" means, and adds temporal stability metrics on top.
+
+---
+
+## 2. Chamfer Distance -- Taught from Scratch
+
+### 2.1 What It Is
+
+The Chamfer distance measures how similar two unordered point sets are. Given sets A and B,
+it asks: "On average, how far does each point in A need to travel to reach its closest
+friend in B, and vice versa?"
+
+### 2.2 Mathematical Definition
+
+Let A = {a_1, ..., a_M} and B = {b_1, ..., b_N} be two point sets in R^2.
+
+**Forward Chamfer (A -> B):**
+
+    CD_forward(A, B) = (1/M) * SUM_{i=1}^{M} min_{j} ||a_i - b_j||_2
+
+**Backward Chamfer (B -> A):**
+
+    CD_backward(A, B) = (1/N) * SUM_{j=1}^{N} min_{i} ||b_j - a_i||_2
+
+**Symmetric Chamfer Distance:**
+
+    CD(A, B) = ( CD_forward(A, B) + CD_backward(A, B) ) / 2
+
+The result is a scalar in meters representing the average point-to-nearest-neighbor
+distance between the two shapes.
+
+### 2.3 Geometric Intuition
+
+Consider a predicted polyline (P) and a ground truth polyline (G):
+
+```
+  Forward pass: each P point finds its nearest G point
+  ====================================================
+
+       P0------P1------P2------P3         (predicted)
+       |  \      \       |      \
+       |   \      \      |       \
+       v    v      v     v        v       (nearest neighbor arrows)
+      G0----G1------G2----G3------G4      (ground truth)
+
+  Backward pass: each G point finds its nearest P point
+  =====================================================
+
+       P0------P1------P2------P3
+       ^    ^       ^     ^    ^
+       |   /       /      |   /
+       |  /       /       |  /
+      G0----G1------G2----G3------G4
+
+  The symmetric CD averages both passes.
+```
+
+Each arrow represents one nearest-neighbor lookup. The forward pass measures how well
+the prediction covers the ground truth shape. The backward pass measures how well the
+ground truth is covered by predictions. Together they capture both over-prediction
+(hallucinated points far from GT) and under-prediction (GT regions with no nearby
+predicted points).
+
+### 2.4 Why Chamfer and Not Point-Wise L1/L2?
+
+A naive approach would align points by index: compare P[0] with G[0], P[1] with G[1],
+etc. This fails for two reasons:
+
+1. **Index misalignment.** If the predicted polyline starts 2 meters earlier than the
+   GT polyline, every index-matched pair is wrong even though the shape is correct.
+2. **Different sampling densities.** Even with the same number of points, the spacing
+   may differ. Chamfer finds the *geometrically* closest point regardless of index.
+
+Chamfer distance is permutation-invariant within each set. It cares about shape
+proximity, not about which point has which index.
+
+### 2.5 Direction-Aware Chamfer Distance
+
+A polyline [A, B, C] and the reversed polyline [C, B, A] describe the exact same
+physical lane divider. The direction of traversal is arbitrary in annotation. Without
+handling this, a perfect prediction in reversed order would receive a large penalty.
+
+Solution: compute Chamfer distance in both directions and take the minimum.
+
+```
+  Same physical line, different point orderings:
+
+       Pred:  P0 ---> P1 ---> P2 ---> P3    (left to right)
+       GT:    G3 <--- G2 <--- G1 <--- G0    (right to left)
+
+       CD(Pred, GT_forward) might be large due to index offsets,
+       CD(Pred, GT_reversed) will be small because shapes align.
+
+       Final distance = min(CD_forward, CD_reversed)
+```
+
+### 2.6 Full Python Implementation
 
 ```python
 import numpy as np
 from scipy.spatial.distance import cdist
 
-def chamfer_distance(pred_points, gt_points):
+def chamfer_distance(points_a: np.ndarray, points_b: np.ndarray) -> float:
     """
-    Compute symmetric Chamfer distance between two polylines.
-    
+    Compute symmetric Chamfer distance between two 2D point sets.
+
     Args:
-        pred_points: (K, 2) predicted polyline points
-        gt_points: (K, 2) ground truth polyline points
-    
+        points_a: (M, 2) array -- first point set (e.g., predicted polyline)
+        points_b: (N, 2) array -- second point set (e.g., GT polyline)
+
     Returns:
-        chamfer_dist: scalar, average bidirectional distance in meters
+        Symmetric Chamfer distance in the same units as the input coordinates
+        (meters, in our case).
     """
-    # Pairwise distance matrix
-    dist_matrix = cdist(pred_points, gt_points)  # (K, K)
-    
-    # Forward: for each predicted point, distance to nearest GT point
-    forward_dist = dist_matrix.min(axis=1).mean()  # mean of min distances
-    
-    # Backward: for each GT point, distance to nearest predicted point
-    backward_dist = dist_matrix.min(axis=0).mean()
-    
-    # Symmetric Chamfer distance
-    chamfer_dist = (forward_dist + backward_dist) / 2.0
-    
-    return chamfer_dist
-```
+    # Pairwise Euclidean distance matrix: shape (M, N)
+    dist_matrix = cdist(points_a, points_b, metric='euclidean')
 
-### Why Chamfer Distance?
+    # Forward: for each point in A, find the nearest point in B
+    forward = dist_matrix.min(axis=1).mean()  # average over M points
 
-- **Handles different point densities:** Even though both pred and GT have K points, they may not be aligned index-wise
-- **Robust to small shifts:** Tolerant of slight positional offsets that don't affect semantic correctness
-- **Threshold-friendly:** Easy to threshold for AP computation (element is "correct" if Chamfer < threshold)
+    # Backward: for each point in B, find the nearest point in A
+    backward = dist_matrix.min(axis=0).mean()  # average over N points
 
-### Direction-Aware Chamfer Distance
+    # Symmetric: average of both directions
+    return (forward + backward) / 2.0
 
-Since polylines can be traversed in either direction, the evaluation considers both:
 
-```python
-def direction_aware_chamfer(pred_points, gt_points):
+def direction_aware_chamfer(pred_points: np.ndarray,
+                            gt_points: np.ndarray) -> float:
     """
-    Compute Chamfer distance considering both polyline directions.
-    Returns the minimum of forward and reversed Chamfer distances.
+    Compute Chamfer distance considering both possible polyline traversal orders.
+    Returns the minimum of the two to handle direction ambiguity.
+
+    Args:
+        pred_points: (K, 2) predicted polyline in meters
+        gt_points:   (K, 2) ground truth polyline in meters
+
+    Returns:
+        Minimum Chamfer distance across both GT directions.
     """
-    # Forward direction
     cd_forward = chamfer_distance(pred_points, gt_points)
-    
-    # Reversed direction
-    gt_reversed = gt_points[::-1]
-    cd_reverse = chamfer_distance(pred_points, gt_reversed)
-    
-    return min(cd_forward, cd_reverse)
+    cd_reversed = chamfer_distance(pred_points, gt_points[::-1])
+    return min(cd_forward, cd_reversed)
 ```
+
+### 2.7 Physical Meaning
+
+If direction_aware_chamfer returns 0.4 meters, it means: "On average, every predicted
+point is 0.4 meters away from the nearest ground truth point, and vice versa." In
+driving terms, your lane boundary prediction is off by roughly 40 centimeters -- less
+than a tire width, excellent for lane keeping.
 
 ---
 
-### 2. Average Precision (AP) at Distance Thresholds
+## 3. Average Precision (AP) for Vectorized Maps
 
-AP is computed similarly to object detection AP, but using Chamfer distance instead of IoU:
+### 3.1 How It Differs from Standard Object Detection AP
 
-#### Thresholds
+| Aspect             | Object Detection (COCO)              | Vectorized Map (StreamMapNet)            |
+|--------------------|--------------------------------------|------------------------------------------|
+| Representation     | Bounding box (x, y, w, h)           | Polyline (K ordered 2D points)           |
+| Similarity metric  | IoU (intersection / union)           | Chamfer distance (meters)                |
+| "Correct" means    | IoU > threshold (e.g., 0.5)         | Chamfer < threshold (e.g., 0.5m)         |
+| Threshold meaning  | Fraction overlap                     | Physical proximity in meters             |
+| Matching strategy  | Greedy by confidence                 | Greedy by confidence (same approach)     |
 
-| Threshold | Description | Interpretation |
-|-----------|-------------|----------------|
-| 0.5 m | Strict | Sub-lane-width accuracy |
-| 1.0 m | Moderate | Approximately lane-width accuracy |
-| 1.5 m | Lenient | Within-road accuracy |
+The key insight: in detection, a higher IoU means more overlap -- good. In map eval,
+a *lower* Chamfer distance means closer shapes -- good. So the direction of the
+threshold is flipped: Chamfer < threshold = match (analogous to IoU > threshold).
 
-#### AP Computation Pipeline
+### 3.2 The Precision-Recall Computation
+
+Step by step:
+
+1. **Sort all predictions by confidence score** (descending).
+2. **Greedy matching** -- for each prediction, in confidence order:
+   - Compute direction-aware Chamfer distance to every unmatched GT of the same class
+     in the same frame.
+   - Find the GT with the smallest Chamfer distance.
+   - If that distance < threshold AND the GT is not already matched:
+     - Mark prediction as **True Positive (TP)**.
+     - Mark that GT as consumed (cannot match again).
+   - Otherwise: mark prediction as **False Positive (FP)**.
+3. **False Negatives (FN):** GT elements that were never matched by any prediction.
+4. **Build cumulative P-R curve:**
+   - precision[k] = cumulative_TP[k] / (cumulative_TP[k] + cumulative_FP[k])
+   - recall[k] = cumulative_TP[k] / total_GT_count
+5. **Interpolated AP:** sample precision at evenly spaced recall levels (40 points),
+   taking the maximum precision at or above each recall level.
+
+### 3.3 Full Python Implementation
 
 ```python
-def compute_ap_per_class(predictions, ground_truths, threshold, num_recall_points=40):
+import numpy as np
+from collections import defaultdict
+
+def compute_ap(predictions, ground_truths, threshold, num_recall_points=40):
     """
-    Compute AP for a single class at a given Chamfer distance threshold.
-    
+    Compute Average Precision for one map element class at one threshold.
+
     Args:
-        predictions: list of dicts with 'points' (K,2), 'score' (float), 'frame_id'
-        ground_truths: list of dicts with 'points' (K,2), 'frame_id'
-        threshold: Chamfer distance threshold in meters
-        num_recall_points: number of recall levels for AP interpolation
-    
+        predictions: list of dicts, each with:
+            - 'points': np.ndarray (K, 2) in meters
+            - 'score': float, confidence in [0, 1]
+            - 'frame_id': str or int
+        ground_truths: list of dicts, each with:
+            - 'points': np.ndarray (K, 2) in meters
+            - 'frame_id': str or int
+        threshold: float, Chamfer distance threshold in meters
+        num_recall_points: int, interpolation granularity (default 40)
+
     Returns:
-        ap: Average Precision value
+        ap: float in [0, 1]
     """
-    # Sort predictions by confidence (descending)
-    predictions = sorted(predictions, key=lambda x: x['score'], reverse=True)
-    
-    # Group GT by frame
+    # Sort predictions by confidence (highest first)
+    predictions = sorted(predictions, key=lambda p: p['score'], reverse=True)
+
+    # Organize GT by frame for efficient lookup
     gt_by_frame = defaultdict(list)
     for gt in ground_truths:
         gt_by_frame[gt['frame_id']].append(gt)
-    
-    # Track which GTs have been matched
-    gt_matched = defaultdict(lambda: [False] * 100)
-    
-    tp = np.zeros(len(predictions))
-    fp = np.zeros(len(predictions))
-    
+
+    # Track which GT elements have been matched (per frame)
+    gt_matched = {fid: [False] * len(gts) for fid, gts in gt_by_frame.items()}
+
+    num_preds = len(predictions)
+    tp = np.zeros(num_preds)
+    fp = np.zeros(num_preds)
+
     for pred_idx, pred in enumerate(predictions):
-        frame_id = pred['frame_id']
-        frame_gts = gt_by_frame[frame_id]
-        
+        fid = pred['frame_id']
+        frame_gts = gt_by_frame.get(fid, [])
+
         if len(frame_gts) == 0:
             fp[pred_idx] = 1
             continue
-        
-        # Compute Chamfer distance to all GTs in this frame
-        min_dist = float('inf')
+
+        # Find best unmatched GT in this frame
+        best_dist = float('inf')
         best_gt_idx = -1
-        
+
         for gt_idx, gt in enumerate(frame_gts):
-            if gt_matched[frame_id][gt_idx]:
-                continue  # Already matched
-            
+            if gt_matched[fid][gt_idx]:
+                continue  # Already consumed by a higher-confidence prediction
+
             dist = direction_aware_chamfer(pred['points'], gt['points'])
-            if dist < min_dist:
-                min_dist = dist
+            if dist < best_dist:
+                best_dist = dist
                 best_gt_idx = gt_idx
-        
-        # Check if match is within threshold
-        if min_dist <= threshold and best_gt_idx >= 0:
+
+        # Apply threshold
+        if best_dist <= threshold and best_gt_idx >= 0:
             tp[pred_idx] = 1
-            gt_matched[frame_id][best_gt_idx] = True
+            gt_matched[fid][best_gt_idx] = True
         else:
             fp[pred_idx] = 1
-    
-    # Compute precision-recall curve
+
+    # Cumulative sums
     tp_cumsum = np.cumsum(tp)
     fp_cumsum = np.cumsum(fp)
-    
     total_gt = len(ground_truths)
-    recall = tp_cumsum / total_gt
+
+    # Precision and recall arrays
+    recall = tp_cumsum / max(total_gt, 1)
     precision = tp_cumsum / (tp_cumsum + fp_cumsum)
-    
-    # Interpolated AP (similar to PASCAL VOC 11-point or COCO-style)
+
+    # 40-point interpolated AP
     recall_levels = np.linspace(0, 1, num_recall_points)
-    ap = 0
-    for r_level in recall_levels:
-        precisions_at_recall = precision[recall >= r_level]
-        if len(precisions_at_recall) > 0:
-            ap += precisions_at_recall.max()
+    ap = 0.0
+    for r in recall_levels:
+        # Maximum precision at recall >= r
+        mask = recall >= r
+        if mask.any():
+            ap += precision[mask].max()
     ap /= num_recall_points
-    
+
     return ap
 ```
 
 ---
 
-### 3. Mean Average Precision (mAP)
+## 4. Thresholds Explained with Physical Meaning
 
-mAP is computed by averaging AP across all classes and thresholds:
+### 4.1 Understanding the Numbers
 
-```python
-def compute_mAP(predictions_by_class, ground_truths_by_class):
-    """
-    Compute mean AP across classes and thresholds.
-    
-    Returns:
-        mAP: float, primary evaluation metric
-        detailed_results: dict with per-class, per-threshold AP
-    """
-    thresholds = [0.5, 1.0, 1.5]
-    classes = ['lane_divider', 'road_boundary', 'ped_crossing']
-    
-    results = {}
-    all_aps = []
-    
-    for cls_name in classes:
-        results[cls_name] = {}
-        preds = predictions_by_class[cls_name]
-        gts = ground_truths_by_class[cls_name]
-        
-        for thresh in thresholds:
-            ap = compute_ap_per_class(preds, gts, threshold=thresh)
-            results[cls_name][f'AP_{thresh}'] = ap
-            all_aps.append(ap)
-        
-        # Per-class mean AP (averaged over thresholds)
-        results[cls_name]['AP'] = np.mean([
-            results[cls_name][f'AP_{t}'] for t in thresholds
-        ])
-    
-    # Overall mAP
-    mAP = np.mean(all_aps)
-    
-    return mAP, results
-```
+A standard passenger car is approximately 1.8 meters wide. A highway lane is roughly
+3.5 meters wide. These physical references give meaning to the evaluation thresholds.
 
-### Result Format
+| Threshold | Name    | Physical Intuition                                         |
+|-----------|---------|------------------------------------------------------------|
+| 0.5 m     | Strict  | Half a car width. Sub-lane accuracy. Sufficient for        |
+|           |         | confident lane-keeping even at highway speeds.             |
+| 1.0 m     | Medium  | Roughly one car width. Lane-width accuracy. Adequate for   |
+|           |         | most ADAS lane-keeping but not precise path planning.      |
+| 1.5 m     | Lenient | Within-road accuracy. You know where the road is, but      |
+|           |         | not precisely where individual lanes are.                  |
+
+### 4.2 Visual Representation
 
 ```
-+------------------+--------+--------+--------+--------+
-| Category         | AP@0.5 | AP@1.0 | AP@1.5 |   AP   |
-+------------------+--------+--------+--------+--------+
-| Lane Divider     |  41.2  |  58.3  |  69.4  |  56.3  |
-| Road Boundary    |  38.7  |  57.1  |  71.6  |  55.8  |
-| Ped Crossing     |  33.8  |  51.4  |  65.1  |  50.1  |
-+------------------+--------+--------+--------+--------+
-| mAP              |  37.9  |  55.6  |  68.7  |  54.1  |
-+------------------+--------+--------+--------+--------+
+    What these thresholds look like on a 3.5m lane:
+    ================================================================
+
+    |<------------ 3.5 m lane width ------------>|
+    |                                             |
+    |     GT lane boundary                        |
+    |     |                                       |
+    |     V                                       |
+    |     ========================================|  <-- true position
+    |     :                                       |
+    |  0.5m zone:   xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx|  <-- 0.5m error: still in lane
+    |     :                                       |
+    |  1.0m zone:   xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx|  <-- 1.0m error: near lane center
+    |     :                                       |
+    |  1.5m zone:   xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx|  <-- 1.5m error: near other boundary
+    |                                             |
+    |     ========================================|  <-- other lane boundary
+    |                                             |
+
+    At 0.5m error, the vehicle is safely within its lane.
+    At 1.0m error, you are roughly at the center of the lane (one boundary known well).
+    At 1.5m error, you could be near the opposite boundary -- marginal for lane keeping.
 ```
+
+### 4.3 Choosing the Right Threshold for Your Application
+
+- **Highway autopilot (60+ km/h):** Demand AP@0.5. At high speeds, even 0.5m error
+  compounds quickly and the vehicle must stay centered.
+- **Urban ADAS (30-50 km/h):** AP@1.0 is the practical minimum. Lanes are narrower,
+  but speeds allow for correction.
+- **Rough localization / route planning:** AP@1.5 may suffice. You need to know *which
+  road* and *approximately where lanes are*, not sub-lane precision.
 
 ---
 
-### 4. Per-Element Metrics
+## 5. Per-Element Evaluation
 
-#### Lane Divider Metrics
+### 5.1 Lane Dividers
 
-| Metric | Description |
-|--------|-------------|
-| AP@0.5/1.0/1.5 | Standard AP at distance thresholds |
-| Precision | Fraction of predictions that match a GT |
-| Recall | Fraction of GTs that are detected |
-| Mean Chamfer | Average Chamfer distance for true positives |
+- **Geometry:** Thin lines (dashed or solid) separating adjacent lanes.
+- **Count per scene:** High (10-30 in a typical intersection).
+- **Direction sensitivity:** Yes -- dividers can be traversed either way.
+- **Difficulty:** Medium. They are thin and numerous, requiring precise detection.
+  However, they are repetitive and well-structured.
+- **Typical AP range:** 40-60% (strict to lenient thresholds).
 
-#### Road Boundary Metrics
+### 5.2 Road Boundaries
 
-Same as lane divider, but road boundaries tend to be longer and more continuous, making them easier to detect but harder to localize precisely.
+- **Geometry:** Longer, more continuous curves defining the road edge (curbs, barriers).
+- **Count per scene:** Moderate (2-8).
+- **Direction sensitivity:** Yes.
+- **Difficulty:** Lower than dividers for detection (fewer, more prominent), but
+  harder for precise localization along long curves.
+- **Typical AP range:** 38-72%.
 
-#### Pedestrian Crossing Metrics
+### 5.3 Pedestrian Crossings
 
-Pedestrian crossings are polygons (closed polylines). The Chamfer distance is computed on the closed polygon boundary. These elements are typically fewer in number and more localized.
+- **Geometry:** Closed polygons (rectangle boundaries) marking crosswalks.
+- **Count per scene:** Low (0-4).
+- **Direction sensitivity:** Yes (polygon traversal order).
+- **Difficulty:** Highest. They are rare (class imbalance), localized, and often
+  occluded by pedestrians or vehicles.
+- **Typical AP range:** 33-65%.
+
+### 5.4 Why Each Class Has Different Difficulty
+
+| Factor              | Lane Dividers | Road Boundaries | Ped Crossings |
+|---------------------|---------------|-----------------|---------------|
+| Frequency           | High          | Medium          | Low           |
+| Length              | Medium        | Long            | Short         |
+| Visual saliency     | Medium        | High            | Medium        |
+| Occlusion risk      | Low           | Low             | High          |
+| Class imbalance     | None          | Slight          | Severe        |
 
 ---
 
-### 5. Temporal Consistency Metrics
+## 6. Temporal Consistency Metrics (Unique to StreamMapNet)
 
-Beyond per-frame accuracy, StreamMapNet's streaming design is evaluated for temporal stability:
+Standard map evaluation treats each frame independently. StreamMapNet's key innovation
+is exploiting temporal context via a streaming architecture. These metrics quantify how
+much that helps.
 
-#### Map Element Stability Score
+### 6.1 Map Element Stability Score
 
-Measures how consistent predictions are across consecutive frames for the same physical map element:
+**What it measures:** For the same physical map element observed across consecutive
+frames, how much does the prediction "jitter" after compensating for ego-motion?
+
+**Algorithm:**
+1. Take prediction at frame t.
+2. Apply ego-motion transform to warp it into frame t+1 coordinates.
+3. Find the closest same-class prediction in frame t+1.
+4. Record the Chamfer distance between the warped prediction and its match.
+5. Average over all element-frame pairs.
+
+**Physical meaning:** A stability score of 0.3m means predictions shift by ~30cm
+between frames. A planning module would see lane boundaries wobble by a tire width.
 
 ```python
-def temporal_consistency_score(predictions_sequence):
+import numpy as np
+
+def compute_stability_score(predictions_sequence, ego_motions):
     """
-    Compute temporal consistency across a sequence of frames.
-    
-    For each predicted element at frame t, find its correspondence at frame t+1
-    (after ego-motion compensation) and measure the positional deviation.
-    
+    Compute Map Element Stability Score across a temporal sequence.
+
     Args:
-        predictions_sequence: list of per-frame predictions, 
-                             each containing 'points', 'labels', 'scores'
-    
+        predictions_sequence: list of length T, where each entry is a list of dicts:
+            [{'points': (K,2), 'label': int, 'score': float}, ...]
+        ego_motions: list of (3,3) transformation matrices from frame t to t+1
+
     Returns:
-        consistency_score: average deviation in meters (lower is better)
+        stability_score: float, average positional deviation in meters (lower=better)
     """
     deviations = []
-    
+
     for t in range(len(predictions_sequence) - 1):
         preds_t = predictions_sequence[t]
         preds_t1 = predictions_sequence[t + 1]
-        ego_motion = get_ego_motion(t, t + 1)  # Transform t -> t+1
-        
-        for pred in preds_t['elements']:
-            # Transform prediction from frame t to frame t+1 coordinates
-            pred_warped = transform_points(pred['points'], ego_motion)
-            
-            # Find closest prediction in frame t+1 (same class)
-            min_dist = float('inf')
-            for pred_next in preds_t1['elements']:
+        ego_t_to_t1 = ego_motions[t]  # 3x3 homogeneous transform
+
+        for pred in preds_t:
+            # Warp prediction from frame t into frame t+1 coordinates
+            pts_homogeneous = np.hstack([
+                pred['points'],
+                np.ones((pred['points'].shape[0], 1))
+            ])  # (K, 3)
+            pts_warped = (ego_t_to_t1 @ pts_homogeneous.T).T[:, :2]  # (K, 2)
+
+            # Find best matching prediction in frame t+1 (same class)
+            best_dist = float('inf')
+            for pred_next in preds_t1:
                 if pred_next['label'] != pred['label']:
                     continue
-                dist = chamfer_distance(pred_warped, pred_next['points'])
-                min_dist = min(min_dist, dist)
-            
-            if min_dist < 3.0:  # Only count if element persists
-                deviations.append(min_dist)
-    
-    return np.mean(deviations) if deviations else 0.0
+                dist = chamfer_distance(pts_warped, pred_next['points'])
+                best_dist = min(best_dist, dist)
+
+            # Only count if element persists (not exiting perception range)
+            if best_dist < 3.0:
+                deviations.append(best_dist)
+
+    if len(deviations) == 0:
+        return 0.0
+    return float(np.mean(deviations))
 ```
 
-#### Flicker Rate
+### 6.2 Flicker Rate
 
-Measures how often map elements appear and disappear between consecutive frames:
+**What it measures:** The fraction of predicted map elements that "vanish" between
+consecutive frames despite still being within perception range.
+
+**Definition:** A "flicker" occurs when:
+- An element is predicted at frame t,
+- After ego-motion compensation, it is still within the perception boundary at t+1,
+- Yet NO corresponding prediction (same class, Chamfer < 2m) exists at t+1.
 
 ```python
-def flicker_rate(predictions_sequence, chamfer_threshold=2.0):
+def compute_flicker_rate(predictions_sequence, ego_motions, perception_range,
+                         match_threshold=2.0):
     """
-    Compute the fraction of elements that disappear between consecutive frames.
-    A "flicker" occurs when an element exists at time t but has no correspondence
-    at time t+1 (or vice versa), despite being within the perception range.
-    
+    Compute the flicker rate across a temporal sequence.
+
+    Args:
+        predictions_sequence: list of per-frame prediction lists
+        ego_motions: list of frame-to-frame transforms
+        perception_range: [x_min, y_min, x_max, y_max] in meters
+        match_threshold: max Chamfer to consider a match (meters)
+
     Returns:
-        rate: fraction of element-frame pairs that flicker (lower is better)
+        flicker_rate: float in [0, 1], fraction of elements that flicker (lower=better)
     """
+    x_min, y_min, x_max, y_max = perception_range
     total_elements = 0
-    flickered = 0
-    
+    flickered_elements = 0
+
     for t in range(len(predictions_sequence) - 1):
         preds_t = predictions_sequence[t]
         preds_t1 = predictions_sequence[t + 1]
-        ego_motion = get_ego_motion(t, t + 1)
-        
-        for pred in preds_t['elements']:
-            pred_warped = transform_points(pred['points'], ego_motion)
-            
-            # Check if element is still in perception range at t+1
-            if not is_in_range(pred_warped):
-                continue
-            
+        ego_t_to_t1 = ego_motions[t]
+
+        for pred in preds_t:
+            # Warp to next frame
+            pts_h = np.hstack([pred['points'], np.ones((len(pred['points']), 1))])
+            pts_warped = (ego_t_to_t1 @ pts_h.T).T[:, :2]
+
+            # Check if still within perception range
+            center = pts_warped.mean(axis=0)
+            if not (x_min <= center[0] <= x_max and y_min <= center[1] <= y_max):
+                continue  # Element left the field of view -- not a flicker
+
             total_elements += 1
-            
-            # Check if a corresponding element exists at t+1
-            found = False
-            for pred_next in preds_t1['elements']:
+
+            # Search for correspondence in next frame
+            found_match = False
+            for pred_next in preds_t1:
                 if pred_next['label'] != pred['label']:
                     continue
-                if chamfer_distance(pred_warped, pred_next['points']) < chamfer_threshold:
-                    found = True
+                if chamfer_distance(pts_warped, pred_next['points']) < match_threshold:
+                    found_match = True
                     break
-            
-            if not found:
-                flickered += 1
-    
-    return flickered / max(total_elements, 1)
+
+            if not found_match:
+                flickered_elements += 1
+
+    return flickered_elements / max(total_elements, 1)
 ```
 
-#### Temporal Metrics Comparison
+### 6.3 Why Temporal Metrics Matter for Downstream Planning
 
-| Method | Consistency (m) | Flicker Rate |
-|--------|----------------|--------------|
-| MapTR (single-frame) | 1.42 | 18.3% |
-| StreamMapNet (no temporal) | 1.42 | 18.3% |
-| StreamMapNet (temporal) | 0.67 | 7.2% |
+A planning module converts perceived lane boundaries into a trajectory. If predictions
+flicker:
+- The planner sees a lane divider at t, plans to stay left of it.
+- At t+1 the divider vanishes; the planner has no constraint.
+- At t+2 it reappears; the planner jerks back.
+
+This causes oscillating steering commands even though per-frame AP might be fine.
+Stability score quantifies the magnitude of jitter; flicker rate quantifies its
+frequency.
+
+### 6.4 Comparison: Single-Frame vs. Temporal Model
+
+| Method                       | AP (mAP) | Stability (m) | Flicker Rate |
+|------------------------------|----------|---------------|--------------|
+| MapTR (single-frame)         | 50.3     | 1.42          | 18.3%        |
+| StreamMapNet (no temporal)   | 50.3     | 1.42          | 18.3%        |
+| StreamMapNet (with temporal) | 54.1     | 0.67          | 7.2%         |
+
+StreamMapNet's temporal fusion halves the stability deviation and reduces flicker by
+more than 2x, demonstrating that temporal context is essential for production-grade
+map prediction.
 
 ---
 
-## Evaluation Protocol
+## 7. Evaluation Protocol Details
 
-### Matching Predictions to Ground Truth
+### 7.1 Full Protocol Specification
 
-The evaluation uses greedy matching (not Hungarian) for the AP metric, following the standard object detection protocol:
+| Aspect                  | Specification                                              |
+|-------------------------|------------------------------------------------------------|
+| Matching strategy       | Greedy (highest confidence first, not Hungarian)           |
+| Matching scope          | Per-frame (predictions only match GTs from the same frame) |
+| Direction handling      | Compute CD in both directions, take minimum                |
+| Perception range        | [-30, 30] x [-15, 15] meters (60m forward, 30m lateral)   |
+| GT filtering            | Only evaluate GT elements with path length >= 2 meters     |
+| Point normalization     | Both pred and GT are K=20 equidistant points               |
+| Coordinate system       | Ego-vehicle frame (origin at car center, X forward, Y left)|
+| Model output format     | Normalized [0, 1] coordinates, denormalized before eval    |
+| AP interpolation        | 40-point recall interpolation                              |
+| Confidence scores       | Sigmoid of classification logits                           |
 
-1. **Sort predictions** by confidence score (descending)
-2. **For each prediction** (in confidence order):
-   - Compute Chamfer distance to all unmatched GT elements of the same class in the same frame
-   - If minimum distance < threshold, mark as True Positive (TP) and mark that GT as matched
-   - Otherwise, mark as False Positive (FP)
-3. **Unmatched GT elements** count as False Negatives (FN)
-4. **Compute precision-recall curve** from the cumulative TP/FP counts
+### 7.2 Why Greedy Matching (Not Hungarian)?
 
-### Important Protocol Details
+Hungarian matching finds the globally optimal assignment that minimizes total cost.
+Greedy matching processes predictions one at a time in confidence order. The greedy
+approach is standard in detection (PASCAL VOC, COCO) because:
 
-| Aspect | Protocol |
-|--------|----------|
-| Matching scope | Per-frame (within same frame only) |
-| Matching strategy | Greedy (highest confidence first) |
-| Direction handling | Consider both polyline directions, take min Chamfer |
-| Perception range | [-30m, 30m] x [-15m, 15m] (only evaluate within range) |
-| Confidence threshold | None (use all predictions for P-R curve) |
-| GT filtering | Only GT elements with length >= 2m |
-| Point count (K) | Same for pred and GT (20 points) |
+1. It rewards well-calibrated confidence scores (high-confidence predictions get first
+   pick of GT elements).
+2. It is simpler to implement and debug.
+3. In practice, the results are nearly identical to Hungarian for well-calibrated models.
 
-### Coordinate System for Evaluation
+### 7.3 Denormalization from [0, 1] to Meters
 
-All evaluation is done in the **ego-vehicle coordinate frame**:
-- Origin at ego-vehicle center
-- X-axis pointing forward
-- Y-axis pointing left
-- Units in meters
-
-Predictions and GT are both in normalized [0, 1] coordinates during model output, then denormalized to meters for Chamfer distance computation:
+The model outputs normalized coordinates for numerical stability during training. Before
+evaluation, these must be converted back to physical coordinates:
 
 ```python
 def denormalize_points(points_norm, perception_range):
     """
-    Convert normalized [0, 1] coordinates to metric coordinates.
-    
+    Convert model output from [0, 1] to meters in ego-vehicle frame.
+
     Args:
-        points_norm: (K, 2) in [0, 1]
-        perception_range: [x_min, y_min, x_max, y_max]
-    
+        points_norm: (K, 2) array with values in [0, 1]
+        perception_range: (x_min, y_min, x_max, y_max) in meters
+                          e.g., (-30.0, -15.0, 30.0, 15.0)
+
     Returns:
-        points_metric: (K, 2) in meters
+        points_m: (K, 2) in meters
     """
     x_min, y_min, x_max, y_max = perception_range
-    points_metric = np.zeros_like(points_norm)
-    points_metric[:, 0] = points_norm[:, 0] * (x_max - x_min) + x_min
-    points_metric[:, 1] = points_norm[:, 1] * (y_max - y_min) + y_min
-    return points_metric
+    points_m = np.empty_like(points_norm)
+    points_m[:, 0] = points_norm[:, 0] * (x_max - x_min) + x_min  # X: forward
+    points_m[:, 1] = points_norm[:, 1] * (y_max - y_min) + y_min  # Y: lateral
+    return points_m
 ```
 
 ---
 
-## Running Evaluation
+## 8. Running Evaluation
 
-### Single-GPU Evaluation
+### 8.1 Single-GPU Evaluation
 
 ```bash
 python tools/test.py \
@@ -412,7 +622,7 @@ python tools/test.py \
     --gpu-ids 0
 ```
 
-### Multi-GPU Evaluation
+### 8.2 Multi-GPU Evaluation
 
 ```bash
 bash tools/dist_test.sh \
@@ -422,7 +632,7 @@ bash tools/dist_test.sh \
     --eval chamfer
 ```
 
-### Evaluation with Temporal Consistency Metrics
+### 8.3 With Temporal Consistency Metrics
 
 ```bash
 python tools/test.py \
@@ -432,137 +642,287 @@ python tools/test.py \
     --eval-options sequence_mode=True
 ```
 
-### Evaluation Options
+### 8.4 Evaluation Options Reference
 
-| Flag | Description |
-|------|-------------|
-| `--eval chamfer` | Standard Chamfer-based AP evaluation |
-| `--eval temporal` | Include temporal consistency metrics |
-| `--show-dir vis_results/` | Save visualization of predictions |
-| `--eval-options threshold=1.0` | Custom AP threshold |
-| `--format-only` | Save predictions without evaluation |
+| Flag / Option                         | Description                                    |
+|---------------------------------------|------------------------------------------------|
+| `--eval chamfer`                      | Standard Chamfer-based AP evaluation           |
+| `--eval temporal`                     | Include stability and flicker metrics          |
+| `--show-dir vis_results/`            | Save per-frame BEV visualizations              |
+| `--eval-options threshold=1.0`        | Override AP threshold (single value)           |
+| `--eval-options sequence_mode=True`   | Enable temporal sequence evaluation            |
+| `--format-only`                       | Save predictions to JSON without computing AP  |
+| `--out results.pkl`                   | Save raw results to pickle file                |
+
+### 8.5 Saving and Visualizing Predictions
+
+```bash
+# Save predictions as JSON for offline analysis
+python tools/test.py \
+    configs/streammapnet/streammapnet_r50_24ep_nuscenes.py \
+    work_dirs/streammapnet_r50/epoch_24.pth \
+    --format-only \
+    --eval-options jsonfile_prefix=results/streammapnet
+
+# Visualize predictions overlaid on BEV
+python tools/test.py \
+    configs/streammapnet/streammapnet_r50_24ep_nuscenes.py \
+    work_dirs/streammapnet_r50/epoch_24.pth \
+    --eval chamfer \
+    --show-dir vis_results/bev_overlay/
+```
 
 ---
 
-## Visualization
+## 9. Visualization
 
-### Per-Frame Visualization
+### 9.1 Per-Frame BEV Visualization
 
 ```python
 import matplotlib.pyplot as plt
 import numpy as np
 
-def visualize_map_predictions(pred_elements, gt_elements, perception_range,
-                               save_path=None):
+# Color coding by element class
+CLASS_COLORS = {
+    0: '#FF8C00',   # Lane divider: orange
+    1: '#228B22',   # Road boundary: forest green
+    2: '#4169E1',   # Pedestrian crossing: royal blue
+}
+CLASS_NAMES = {
+    0: 'Lane Divider',
+    1: 'Road Boundary',
+    2: 'Ped Crossing',
+}
+
+def visualize_bev_frame(pred_elements, gt_elements, perception_range,
+                        save_path=None, title=''):
     """
-    Visualize predicted and GT map elements in BEV.
+    Render predicted and ground truth map elements side-by-side in BEV.
+
+    Args:
+        pred_elements: list of {'points': (K,2), 'label': int, 'score': float}
+        gt_elements:   list of {'points': (K,2), 'label': int}
+        perception_range: (x_min, y_min, x_max, y_max)
+        save_path: optional path to save the figure
+        title: optional figure title
     """
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-    
-    class_colors = {
-        0: 'orange',    # Lane divider
-        1: 'green',     # Road boundary
-        2: 'blue',      # Pedestrian crossing
-    }
-    class_names = ['Lane Divider', 'Road Boundary', 'Ped Crossing']
-    
-    # GT
-    ax = axes[0]
-    ax.set_title('Ground Truth')
-    for elem in gt_elements:
-        pts = elem['points']  # (K, 2) in meters
-        color = class_colors[elem['label']]
-        ax.plot(pts[:, 1], pts[:, 0], color=color, linewidth=2)
-    
-    ax.set_xlim(perception_range[1], perception_range[3])
-    ax.set_ylim(perception_range[0], perception_range[2])
-    ax.set_aspect('equal')
-    ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
-    
-    # Predictions
-    ax = axes[1]
-    ax.set_title('Predictions')
-    for elem in pred_elements:
-        pts = elem['points']
-        color = class_colors[elem['label']]
-        alpha = min(1.0, elem['score'] + 0.3)
-        ax.plot(pts[:, 1], pts[:, 0], color=color, linewidth=2, alpha=alpha)
-    
-    ax.set_xlim(perception_range[1], perception_range[3])
-    ax.set_ylim(perception_range[0], perception_range[2])
-    ax.set_aspect('equal')
-    ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
-    
-    # Legend
-    legend_elements = [plt.Line2D([0], [0], color=c, label=n) 
-                       for c, n in zip(class_colors.values(), class_names)]
-    fig.legend(handles=legend_elements, loc='lower center', ncol=3)
-    
-    plt.tight_layout()
+    x_min, y_min, x_max, y_max = perception_range
+    fig, (ax_gt, ax_pred) = plt.subplots(1, 2, figsize=(16, 8))
+
+    for ax, elements, name in [(ax_gt, gt_elements, 'Ground Truth'),
+                                (ax_pred, pred_elements, 'Predictions')]:
+        ax.set_title(f'{name} {title}')
+        ax.set_xlim(y_min, y_max)
+        ax.set_ylim(x_min, x_max)
+        ax.set_aspect('equal')
+        ax.set_xlabel('Lateral Y (m)')
+        ax.set_ylabel('Forward X (m)')
+        ax.axhline(0, color='gray', linewidth=0.5, linestyle='--')
+        ax.axvline(0, color='gray', linewidth=0.5, linestyle='--')
+
+        for elem in elements:
+            pts = elem['points']  # (K, 2) in meters: col 0=X, col 1=Y
+            color = CLASS_COLORS[elem['label']]
+            alpha = min(1.0, elem.get('score', 1.0) + 0.3)
+            ax.plot(pts[:, 1], pts[:, 0], color=color, linewidth=2, alpha=alpha)
+
+    # Shared legend
+    legend_handles = [plt.Line2D([0], [0], color=c, linewidth=2, label=CLASS_NAMES[k])
+                      for k, c in CLASS_COLORS.items()]
+    fig.legend(handles=legend_handles, loc='lower center', ncol=3, fontsize=11)
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    plt.close(fig)
 ```
 
-### Temporal Sequence Visualization
+### 9.2 Temporal Sequence Video Generation
 
 ```bash
-# Generate video of predictions across a sequence
+# Generate frame sequence as images, then assemble into video
 python tools/visualize_sequence.py \
     --config configs/streammapnet/streammapnet_r50_24ep_nuscenes.py \
     --checkpoint work_dirs/streammapnet_r50/epoch_24.pth \
     --scene-token <scene_token> \
     --output-dir vis_results/sequence/ \
-    --format video
+    --format video \
+    --fps 4
+```
+
+To assemble manually with ffmpeg:
+
+```bash
+ffmpeg -framerate 4 -pattern_type glob -i 'vis_results/sequence/*.png' \
+    -c:v libx264 -pix_fmt yuv420p vis_results/sequence.mp4
 ```
 
 ---
 
-## Benchmark Results Reference
+## 10. Benchmark Results Reference
 
-### nuScenes val set (24 epochs, ResNet-50)
+### 10.1 nuScenes val Set (24 epochs, ResNet-50 backbone)
 
-| Method | Divider | Boundary | Ped Cross | mAP |
-|--------|---------|----------|-----------|-----|
-| HDMapNet | 18.5 | 37.6 | 14.1 | 23.4 |
-| VectorMapNet | 36.2 | 43.5 | 28.5 | 36.1 |
-| MapTR | 51.5 | 53.1 | 46.3 | 50.3 |
-| MapTRv2 | 55.7 | 57.4 | 49.2 | 54.1 |
-| StreamMapNet | 56.3 | 55.8 | 50.1 | 54.1 |
+| Method         | Divider | Boundary | Ped Cross | mAP  |
+|----------------|---------|----------|-----------|------|
+| HDMapNet       | 18.5    | 37.6     | 14.1      | 23.4 |
+| VectorMapNet   | 36.2    | 43.5     | 28.5      | 36.1 |
+| MapTR          | 51.5    | 53.1     | 46.3      | 50.3 |
+| MapTRv2        | 55.7    | 57.4     | 49.2      | 54.1 |
+| StreamMapNet   | 56.3    | 55.8     | 50.1      | 54.1 |
 
-### Argoverse 2 val set
+Note: StreamMapNet matches MapTRv2 on per-frame mAP while significantly outperforming
+on temporal consistency (see Section 6.4).
 
-| Method | Divider | Boundary | Ped Cross | mAP |
-|--------|---------|----------|-----------|-----|
-| MapTR | 58.7 | 60.3 | 52.1 | 57.0 |
-| StreamMapNet | 62.4 | 63.1 | 56.8 | 60.8 |
+### 10.2 Argoverse 2 val Set
+
+| Method         | Divider | Boundary | Ped Cross | mAP  |
+|----------------|---------|----------|-----------|------|
+| MapTR          | 58.7    | 60.3     | 52.1      | 57.0 |
+| StreamMapNet   | 62.4    | 63.1     | 56.8      | 60.8 |
+
+Argoverse 2 provides richer temporal annotations, making StreamMapNet's temporal
+advantage more pronounced (+3.8 mAP over MapTR compared to +3.8 on nuScenes).
 
 ---
 
-## Common Evaluation Pitfalls
+## 11. Common Evaluation Pitfalls
 
-### 1. Inconsistent Perception Range
+### 11.1 Inconsistent Perception Range
 
-Ensure the same perception range is used for both training and evaluation. Mismatched ranges lead to unfair comparisons.
+**Problem:** Training uses [-30, 30] x [-15, 15] but evaluation uses [-60, 60] x [-30, 30].
+The model has never seen points in the extended range and performs poorly.
 
-### 2. Direction Ambiguity
+**Fix:** Always verify that the perception_range in the evaluation config matches training.
 
-Always evaluate with direction-aware Chamfer distance. Without it, a correctly detected polyline with reversed point order would be penalized heavily.
+### 11.2 Direction Ambiguity
 
-### 3. Point Count Mismatch
+**Problem:** Evaluating with standard (non-direction-aware) Chamfer distance. A perfect
+prediction with reversed point order receives a large penalty.
 
-If the model outputs a different number of points than the GT, resample both to the same K before computing Chamfer distance. The standard is K=20.
+**Fix:** Always use `direction_aware_chamfer()` which takes the minimum of both orderings.
 
-### 4. Confidence Calibration
+### 11.3 Point Count Mismatch
 
-AP is sensitive to confidence score ordering. Poor calibration (e.g., all scores clustered near 0.5) can hurt AP even with good detection quality. Use the raw classification logits (after sigmoid) as confidence scores.
+**Problem:** Model predicts 20 points per element, but GT has 50 points (or vice versa).
+Chamfer distance is still computable but the density difference biases the backward term.
 
-### 5. Scene Boundary Handling
+**Fix:** Resample both prediction and GT to the same number of equidistant points (K=20)
+before computing Chamfer distance. Use linear interpolation along the polyline arc length.
 
-When evaluating temporal consistency, exclude the first frame of each scene (where no temporal context is available) from temporal metrics but include it in per-frame mAP.
+### 11.4 Confidence Calibration
 
-### 6. Evaluation on v1.0-mini
+**Problem:** All predictions have scores clustered around 0.5. The greedy matching order
+becomes nearly random, hurting AP.
 
-The mini split is too small for reliable evaluation (only 10 scenes). Use it only for sanity checks, not for reporting metrics.
+**Fix:** Use raw sigmoid outputs as confidence scores. If calibration is poor, consider
+temperature scaling as a post-processing step. Never threshold predictions before AP
+computation -- the P-R curve needs the full score distribution.
+
+### 11.5 Scene Boundary Handling
+
+**Problem:** The first frame of each scene has no temporal history. Including it in
+temporal metrics (stability, flicker) unfairly penalizes the model.
+
+**Fix:** Exclude the first frame from temporal metrics, but still include it in per-frame
+AP computation. When the temporal buffer has `N` history frames, exclude the first `N`
+frames from temporal metrics.
+
+### 11.6 Mini Split Limitations
+
+**Problem:** Reporting metrics on nuScenes v1.0-mini (10 scenes, ~400 frames) and
+treating them as final results. Variance is extremely high on such small data.
+
+**Fix:** Use mini only for sanity checks (smoke tests during development). Always report
+final metrics on the full validation set (150 scenes, ~6000 frames).
+
+---
+
+## 12. Interpretation Guide
+
+### 12.1 What Makes a "Good" Map Prediction?
+
+A production-quality map prediction system should achieve:
+- AP@0.5 > 50% for lane dividers (sub-lane precision on most elements)
+- Flicker rate < 10% (stable enough for planning)
+- Stability score < 0.5m (jitter less than a tire width)
+
+### 12.2 Diagnostic Patterns
+
+**High AP but high flicker rate:**
+- Diagnosis: The model is accurate per-frame but temporally inconsistent.
+- Cause: Insufficient temporal fusion or history length.
+- Action: Increase the propagation queue length or add explicit temporal loss terms.
+
+**Low AP specifically on pedestrian crossings:**
+- Diagnosis: Rare class underperformance (class imbalance).
+- Cause: Crossings appear in ~30% of frames; the model under-represents them.
+- Action: Apply class-weighted loss, oversample crossing-heavy scenes, or use
+  copy-paste augmentation for crossings.
+
+**AP@0.5 much lower than AP@1.5 (large gap):**
+- Diagnosis: The model detects elements but localizes them poorly.
+- Cause: Regression head underfitting or insufficient resolution in BEV features.
+- Action: Increase BEV resolution, add auxiliary point regression losses, or use
+  iterative refinement (deformable attention on predicted points).
+
+**Good AP on nuScenes but poor on Argoverse 2:**
+- Diagnosis: Domain gap between datasets.
+- Cause: Different camera setups, map annotation conventions, or road geometries.
+- Action: Verify preprocessing, check perception range consistency, consider
+  dataset-specific fine-tuning.
+
+### 12.3 When to Use Which Threshold
+
+| Use Case                              | Primary Threshold | Rationale                          |
+|---------------------------------------|-------------------|------------------------------------|
+| Highway lane-keeping (L2+)            | AP@0.5            | Must be sub-lane precise           |
+| Urban navigation assistance           | AP@1.0            | Moderate precision, many elements  |
+| Coarse route planning                 | AP@1.5            | Structural correctness sufficient  |
+| Model comparison (paper reporting)    | mAP (all three)   | Gives full accuracy profile        |
+| Temporal quality assessment           | Stability + Flicker| Complements per-frame AP           |
+
+### 12.4 Reading Results Holistically
+
+Never report a single number in isolation. A complete evaluation includes:
+1. **Per-class AP at all thresholds** -- reveals which elements and accuracy levels
+   are problematic.
+2. **mAP** -- the headline number for paper comparisons.
+3. **Temporal metrics** -- essential for any system that will feed a planner.
+4. **Qualitative visualization** -- numbers can hide failure modes (e.g., the model
+   might hallucinate a parallel lane divider that hurts precision but not recall).
+
+---
+
+## Summary of Key Formulas
+
+```
+Chamfer Distance:
+  CD(A, B) = [ (1/M) * sum_i min_j ||a_i - b_j|| + (1/N) * sum_j min_i ||b_j - a_i|| ] / 2
+
+Direction-Aware Chamfer:
+  DAC(P, G) = min( CD(P, G), CD(P, reverse(G)) )
+
+True Positive condition:
+  DAC(pred, gt) <= threshold  AND  gt is not yet matched
+
+Precision at rank k:
+  P(k) = TP_cumulative(k) / (TP_cumulative(k) + FP_cumulative(k))
+
+Recall at rank k:
+  R(k) = TP_cumulative(k) / |GT_total|
+
+Interpolated AP (40-point):
+  AP = (1/40) * sum_{r in linspace(0,1,40)} max_{k: R(k)>=r} P(k)
+
+Stability Score:
+  S = mean over (t, element) of CD(warp(pred_t, ego_t->t+1), pred_t+1)
+
+Flicker Rate:
+  F = |{elements at t with no match at t+1 despite being in range}| / |{elements at t in range}|
+```
+
+---
+
+*This guide accompanies the StreamMapNet evaluation codebase. For implementation details,
+see `tools/test.py` and `plugin/datasets/evaluation/` in the repository.*

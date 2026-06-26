@@ -1,212 +1,459 @@
-# BEVFormer: Data Collection Guide
+# BEVFormer: Data Collection and Dataset Guide
 
-## nuScenes Dataset Requirements
+## Understanding the nuScenes Dataset from First Principles
 
-BEVFormer is trained and evaluated on the **nuScenes** dataset, a large-scale autonomous driving dataset designed for holistic 3D perception research.
+This guide teaches you everything about the nuScenes dataset that BEVFormer uses -- from sensor setup and coordinate systems to download instructions and annotation formats. Written for engineers who know deep learning but are new to autonomous driving datasets.
 
 ---
 
-## 1. Dataset Overview
+## 1. What Is nuScenes?
+
+### 1.1 History and Significance
+
+nuScenes (short for "nuTonomy Scenes") was released in 2019 by nuTonomy (later acquired by Aptiv/Motional). It was the first large-scale autonomous driving dataset to provide:
+- Full 360-degree camera coverage (6 cameras)
+- Synchronized multi-modal data (cameras, LiDAR, radar, GPS/IMU)
+- 3D bounding box annotations with velocity and attributes
+- Temporal tracking annotations (same object across frames)
+
+### 1.2 Why nuScenes Became the Standard for Camera-Based 3D Detection
+
+| Dataset | Cameras | 360-deg | Velocity Labels | Temporal Tracking | BEV methods built on it |
+|---------|---------|---------|-----------------|-------------------|-----------------------|
+| KITTI (2012) | 2 (stereo) | No (front only) | No | No | Few |
+| Waymo Open (2019) | 5 | Yes | No (must derive) | Yes | Some |
+| **nuScenes (2019)** | **6** | **Yes** | **Yes** | **Yes** | **Most** (BEVFormer, BEVDet, PETR, etc.) |
+| Argoverse 2 (2021) | 7 | Yes | No | Yes | Growing |
+
+nuScenes became the standard because: (a) full 360 coverage matches real deployment, (b) velocity annotations enable temporal model evaluation, (c) the evaluation server and metrics (NDS) became widely adopted, and (d) the dataset size is manageable (not petabytes like Waymo).
+
+### 1.3 Dataset Statistics
 
 | Property | Value |
 |----------|-------|
-| Total scenes | 1,000 |
-| Scene duration | ~20 seconds each |
-| Total keyframes | 40,000 (annotated at 2 Hz) |
-| Total sweep frames | ~1,400,000 (unannotated at ~12 Hz) |
-| Cameras | 6 (full 360-degree surround) |
-| LiDAR | 1 (32-beam, 360-degree) |
-| Radar | 5 (long-range + short-range) |
-| GPS/IMU | Yes (for ego-pose) |
-| Location | Boston, Singapore |
-| Weather/Time | Day, night, rain, overcast |
-| Annotation classes | 23 (10 used for detection) |
-| Split | Train: 700 / Val: 150 / Test: 150 |
-
-### Key Dataset Properties for BEVFormer
-
-- **Keyframe annotations at 2 Hz:** BEVFormer uses these keyframes for training with temporal pairs (current + previous frame at 0.5s interval)
-- **Full calibration data:** Camera intrinsics and extrinsics are provided per frame, enabling the spatial cross-attention projection
-- **Ego-pose data:** Required for temporal self-attention alignment between frames
-- **Sweep data (optional):** Intermediate unannotated frames can be used for denser temporal modeling
+| Total driving scenes | 1,000 (each ~20 seconds) |
+| Annotated keyframes | 40,000 (at 2 Hz) |
+| Total camera frames (sweeps) | ~1,400,000 (at 12 Hz) |
+| Number of cameras | 6 (full 360-degree surround) |
+| LiDAR | 1 (Velodyne HDL-32E, 32-beam, 20 Hz) |
+| Radar | 5 (Continental ARS 408-21) |
+| GPS/IMU | Yes (Novatel SPAN-CPT) |
+| Locations | Boston (USA), Singapore |
+| Conditions | Day, night, rain, overcast |
+| Annotation classes | 23 total, 10 used for detection task |
+| Data split | Train: 700 scenes / Val: 150 / Test: 150 |
+| Total annotations | ~1.4 million 3D bounding boxes |
 
 ---
 
-## 2. Camera Setup
+## 2. Sensor Setup
 
-### 2.1 Camera Configuration
-
-nuScenes uses 6 cameras providing a full 360-degree horizontal field of view:
+### 2.1 Vehicle and Camera Arrangement
 
 ```
-                    FRONT
-                   /     \
-          FRONT_LEFT     FRONT_RIGHT
-              |               |
-          BACK_LEFT      BACK_RIGHT
-                   \     /
-                    BACK
+                    TOP-DOWN VIEW OF VEHICLE
+    ================================================================
+    
+                        CAM_FRONT (70 deg FOV)
+                            |
+                        +---+---+
+                       /    |    \
+                      /     |     \
+    CAM_FRONT_LEFT   /      |      \   CAM_FRONT_RIGHT
+    (70 deg FOV)    /       |       \  (70 deg FOV)
+                   /        |        \
+                  /    +---------+    \
+                 /     |         |     \
+                |      |  EGO    |      |
+                |      | VEHICLE |      |
+                |      |    *    |      |    * = origin (rear axle center)
+                 \     |         |     /
+                  \    +---------+    /
+                   \        |        /
+    CAM_BACK_LEFT   \       |       /   CAM_BACK_RIGHT
+    (70 deg FOV)     \      |      /    (70 deg FOV)
+                      \     |     /
+                       \    |    /
+                        +---+---+
+                            |
+                        CAM_BACK (110 deg FOV)
+    
+    ================================================================
+    
+    Camera positions (approximate, relative to rear axle):
+    
+    Camera           X (forward)   Y (left)   Z (up)   Heading
+    ------           -----------   --------   ------   -------
+    CAM_FRONT         1.70 m        0.00 m    1.51 m   0 deg
+    CAM_FRONT_LEFT    1.69 m        0.46 m    1.49 m   +55 deg
+    CAM_FRONT_RIGHT   1.69 m       -0.46 m    1.49 m   -55 deg
+    CAM_BACK          0.02 m        0.00 m    1.57 m   180 deg
+    CAM_BACK_LEFT     1.03 m        0.48 m    1.56 m   +110 deg
+    CAM_BACK_RIGHT    1.03 m       -0.48 m    1.56 m   -110 deg
 ```
 
-| Camera | Horizontal FOV | Orientation | Primary Coverage |
-|--------|---------------|-------------|-----------------|
-| CAM_FRONT | 70 deg | Forward | 0 deg (forward) |
-| CAM_FRONT_LEFT | 70 deg | Forward-left | ~55 deg left |
-| CAM_FRONT_RIGHT | 70 deg | Forward-right | ~55 deg right |
-| CAM_BACK | 110 deg | Backward | 180 deg (rear) |
-| CAM_BACK_LEFT | 70 deg | Backward-left | ~110 deg left |
-| CAM_BACK_RIGHT | 70 deg | Backward-right | ~110 deg right |
+### 2.2 Field of View and Coverage
 
-### 2.2 Camera Specifications
+```
+    360-DEGREE COVERAGE MAP (viewed from above):
+    
+                    0 deg (forward)
+                        |
+              FRONT_LEFT | FRONT_RIGHT
+                   \     |     /
+                    \  FRONT  /
+                     \ (70) /
+              (70)    \   /    (70)
+                 ------[*]------
+              (70)    /   \    (70)
+                     / (110)\
+                    / BACK   \
+                   /     |    \
+              BACK_LEFT  | BACK_RIGHT
+                        |
+                    180 deg (backward)
+    
+    Overlap regions: ~10-15 degrees between adjacent cameras
+    Total coverage: Full 360 degrees (no blind spots in horizontal plane)
+    Vertical FOV: approximately 40-50 degrees per camera
+```
+
+### 2.3 Why This Specific Setup?
+
+1. **6 cameras (not 4 or 8):** 6 cameras with 70-degree FOV (plus one 110-degree rear) is the minimum for complete 360-degree coverage with reasonable overlap. Fewer cameras would leave blind spots; more would increase cost and data bandwidth without proportional benefit.
+
+2. **Front camera at 70 deg (not wider):** Narrower FOV means higher pixel density at distance, which is critical for detecting far objects ahead (where driving decisions are most time-critical).
+
+3. **Back camera at 110 deg:** The rear has a larger gap between the two back cameras. A wider FOV compensates for this, ensuring no blind spot behind the vehicle.
+
+4. **Cameras mounted high (~1.5m):** Reduces occlusion from the hood and provides better viewing angles for nearby objects.
+
+### 2.4 Camera Specifications
 
 | Property | Value |
 |----------|-------|
 | Resolution | 1600 x 900 pixels |
-| Sensor | 1/2.7" CMOS |
-| Frame rate | 12 Hz (keyframes at 2 Hz) |
-| Color depth | 8-bit RGB |
-| Format | JPEG |
-| Lens type | Wide-angle (varies per position) |
-
-### 2.3 Camera Overlap
-
-- Adjacent cameras have ~10-15 degrees of overlap
-- The front camera and front-left/front-right cameras overlap in the forward-diagonal directions
-- Back camera has wider FOV (110 deg) to compensate for the larger gap between rear cameras
-
-### 2.4 Relevance to BEVFormer
-
-BEVFormer's spatial cross-attention projects 3D reference points onto all 6 camera image planes. For each BEV query:
-- Reference points are projected to every camera
-- Only cameras where the projection falls within valid image bounds contribute features
-- This naturally handles the 360-degree coverage without explicit view assignment
+| Sensor type | 1/2.7" CMOS |
+| Frame rate | 12 Hz (keyframes selected at 2 Hz) |
+| Color depth | 8-bit RGB (24-bit total) |
+| File format | JPEG (lossy compression) |
+| Lens type | Wide-angle, varies by position |
+| Images undistorted | Yes (factory calibrated, distortion removed) |
 
 ---
 
-## 3. Download Instructions
+## 3. Coordinate Systems (In-Depth)
 
-### 3.1 Registration and Access
+Understanding coordinate systems is CRITICAL for BEVFormer because the model constantly transforms between them (image pixels <-> camera frame <-> ego frame <-> global frame).
 
-1. Visit [https://www.nuscenes.org/](https://www.nuscenes.org/)
-2. Create a free account (academic/commercial)
-3. Accept the Terms of Use
-4. Navigate to the Download page
-
-### 3.2 Dataset Versions
-
-| Version | Size | Use Case |
-|---------|------|----------|
-| Full dataset (v1.0-trainval) | ~400 GB | Full training and validation |
-| Full dataset (v1.0-test) | ~60 GB | Test set submission |
-| Mini dataset (v1.0-mini) | ~4 GB | Development and debugging |
-
-### 3.3 Download Commands
-
-```bash
-# Option 1: Direct download via browser
-# Navigate to nuscenes.org/download and download archives
-
-# Option 2: Using the official download script
-pip install nuscenes-devkit
-python -c "from nuscenes.utils.download import download; download('v1.0-trainval', '/data/nuscenes')"
-
-# Option 3: AWS CLI (faster for large downloads)
-# Requires AWS credentials from nuscenes.org
-aws s3 cp s3://nuscenes/v1.0-trainval/ /data/nuscenes/ --recursive --no-sign-request
-```
-
-### 3.4 Required Archives for BEVFormer
-
-For the **full dataset**, download these archives:
+### 3.1 Global Frame
 
 ```
-v1.0-trainval_meta.tgz          (~300 MB)  - Annotations, calibration, ego-pose
-v1.0-trainval01_blobs.tgz       (~70 GB)   - Camera images batch 1
-v1.0-trainval02_blobs.tgz       (~70 GB)   - Camera images batch 2
-v1.0-trainval03_blobs.tgz       (~70 GB)   - Camera images batch 3
-v1.0-trainval04_blobs.tgz       (~70 GB)   - Camera images batch 4
-v1.0-trainval05_blobs.tgz       (~70 GB)   - Camera images batch 5
-v1.0-trainval06_blobs.tgz       (~70 GB)   - Camera images batch 6
-v1.0-trainval07_blobs.tgz       (~20 GB)   - Camera images batch 7
-v1.0-trainval08_blobs.tgz       (~20 GB)   - Camera images batch 8
-v1.0-trainval09_blobs.tgz       (~20 GB)   - Camera images batch 9
-v1.0-trainval10_blobs.tgz       (~20 GB)   - Camera images batch 10
+    Global Frame (fixed to Earth/map):
+    
+         North (Y)
+         ^
+         |
+         |
+         +-------> East (X)
+        /
+       /
+      v
+    Down (-Z)    ...but convention is Z-up, so:
+    
+    Actually:   X = East
+                Y = North  
+                Z = Up
+    
+    Origin: An arbitrary fixed point in the map
+    Used for: Absolute positioning, HD map alignment
 ```
 
-**Note:** BEVFormer is camera-only, so LiDAR point cloud archives are NOT required for training. However, LiDAR data may be needed for:
-- Generating ground truth depth maps (if using depth supervision)
-- Evaluation scripts that reference point cloud data
+The global frame does NOT move with the vehicle. It is a fixed reference anchored to the world.
 
-### 3.5 Mini Dataset (for development)
+### 3.2 Ego Vehicle Frame
 
-```bash
-# Download mini split for quick testing
-wget https://www.nuscenes.org/data/v1.0-mini.tgz
-tar -xzf v1.0-mini.tgz -C /data/nuscenes/
+```
+    Ego Vehicle Frame (moves with car):
+    
+         Z (Up)
+         ^
+         |
+         |
+         +-------> Y (Left, driver side for right-hand-drive)
+        /
+       /
+      v
+    X (Forward, direction of travel)
+    
+    Wait -- that's ambiguous. Let me be precise:
+    
+    X-axis: Points FORWARD (direction the car faces)
+    Y-axis: Points LEFT (driver's left for left-hand drive)
+    Z-axis: Points UP
+    
+    Origin: Center of rear axle, projected onto ground plane
 ```
 
-The mini dataset contains 10 scenes (4 train, 4 val, 2 test) and is sufficient for verifying the data pipeline.
+**Why rear axle?** The rear axle is the center of rotation for a car (front wheels steer, rear wheels follow). This makes kinematic calculations simpler.
+
+### 3.3 Camera Frame
+
+```
+    Camera Frame (standard computer vision convention):
+    
+    Looking OUT through the camera:
+    
+         Y (Down)
+         ^
+         |
+         |  Z (Forward = optical axis, into the scene)
+         | /
+         |/
+         +-------> X (Right)
+    
+    Origin: Camera optical center (pinhole)
+```
+
+**IMPORTANT:** The camera frame has Y pointing DOWN. This is different from the ego frame (Y-left) and global frame (Y-north). This convention comes from image processing where row 0 is at the top.
+
+### 3.4 Image Frame (Pixel Coordinates)
+
+```
+    Image Frame:
+    
+    (0, 0) -----> u (column, 0 to 1599)
+       |
+       |
+       v
+       v (row, 0 to 899)
+    
+    Origin: Top-left corner of the image
+    u-axis: Points right (column index)
+    v-axis: Points down (row index)
+```
+
+### 3.5 Transformation Chain
+
+To go from a 3D point in the world to a 2D pixel in an image:
+
+```
+    Global Frame          Ego Frame            Camera Frame         Image Frame
+    (world coords)  -->  (vehicle coords)  -->  (camera coords)  -->  (pixels)
+    
+    [x_global]     ego_pose       [x_ego]      calib_sensor     [x_cam]      intrinsics    [u]
+    [y_global]  ------------>     [y_ego]   -------------->     [y_cam]   ------------>    [v]
+    [z_global]   (inverse)        [z_ego]    (inverse)          [z_cam]    (project)
+    [ 1      ]                    [ 1   ]                       [ 1   ]
+```
+
+For BEVFormer, the relevant transformation is: **Ego Frame -> Image Frame** (project BEV positions to camera pixels).
 
 ---
 
-## 4. Data Format
+## 4. Camera Intrinsic and Extrinsic Matrices
 
-### 4.1 Directory Structure
+### 4.1 Intrinsics: The Pinhole Camera Model
+
+The intrinsic matrix describes how a camera projects 3D points (in camera coordinates) to 2D image pixels.
+
+**The Pinhole Camera Model:**
 
 ```
-nuscenes/
-├── maps/                          # Map raster images
-│   ├── basemap/
-│   └── expansion/
-├── samples/                       # Keyframe sensor data (2 Hz)
-│   ├── CAM_FRONT/
-│   ├── CAM_FRONT_LEFT/
-│   ├── CAM_FRONT_RIGHT/
-│   ├── CAM_BACK/
-│   ├── CAM_BACK_LEFT/
-│   ├── CAM_BACK_RIGHT/
-│   ├── LIDAR_TOP/
-│   ├── RADAR_FRONT/
-│   ├── RADAR_FRONT_LEFT/
-│   ├── RADAR_FRONT_RIGHT/
-│   ├── RADAR_BACK_LEFT/
-│   └── RADAR_BACK_RIGHT/
-├── sweeps/                        # Intermediate frames (~12 Hz)
-│   ├── CAM_FRONT/
-│   ├── ...
-│   └── LIDAR_TOP/
-└── v1.0-trainval/                 # Metadata JSON files
-    ├── attribute.json
-    ├── calibrated_sensor.json
-    ├── category.json
-    ├── ego_pose.json
-    ├── instance.json
-    ├── log.json
-    ├── map.json
-    ├── sample.json
-    ├── sample_annotation.json
-    ├── sample_data.json
-    ├── scene.json
-    ├── sensor.json
-    └── visibility.json
+    Physical picture:
+    
+    3D Point P -------- lens/pinhole -------- Image Plane
+    (X, Y, Z)              |                  (u, v)
+                        focal length f
+                           |<----->|
+    
+    By similar triangles:
+        u = f * X / Z + cx
+        v = f * Y / Z + cy
+    
+    Where:
+        f = focal length (distance from pinhole to image plane, in pixels)
+        cx, cy = principal point (where the optical axis hits the image)
 ```
 
-### 4.2 Key Metadata Tables
+**The 3x3 Intrinsic Matrix K:**
 
-#### sample.json
-Each sample represents a keyframe timestamp with all sensors synchronized:
+```
+    K = [fx   0   cx]
+        [ 0  fy   cy]
+        [ 0   0    1]
+    
+    Typical values for nuScenes CAM_FRONT:
+    K = [1266.4    0     816.3]
+        [   0   1266.4   491.5]
+        [   0      0       1  ]
+```
+
+| Parameter | Symbol | Meaning | Typical Value |
+|-----------|--------|---------|---------------|
+| Focal length X | fx | Horizontal magnification (pixels/radian) | ~1266 |
+| Focal length Y | fy | Vertical magnification (usually = fx) | ~1266 |
+| Principal point X | cx | Image center column (should be ~W/2) | ~816 |
+| Principal point Y | cy | Image center row (should be ~H/2) | ~491 |
+
+**Worked example: Project a 3D point to pixel**
+
+```
+Point in camera frame: P_cam = (2.0, -0.5, 10.0) meters
+  (2m to the right, 0.5m above optical axis, 10m ahead)
+
+Using K = [[1266, 0, 816], [0, 1266, 491], [0, 0, 1]]:
+
+p = K @ [2.0, -0.5, 10.0]^T = [1266*2 + 816*10, 1266*(-0.5) + 491*10, 10]
+                                = [2532 + 8160, -633 + 4910, 10]
+                                = [10692, 4277, 10]
+
+Pixel: u = 10692 / 10 = 1069.2
+       v = 4277 / 10 = 427.7
+
+So the point appears at pixel (1069, 428) -- right of center, above center.
+This makes sense: the point is to the right and above the optical axis.
+```
+
+### 4.2 Extrinsics: Rigid Body Transformation
+
+The extrinsic parameters describe where the camera is physically mounted on the vehicle.
+
+**Components:**
+- Rotation R (3x3 matrix): How the camera is oriented relative to the ego frame
+- Translation t (3x1 vector): Where the camera is positioned relative to the ego frame
+
+**The 4x4 Homogeneous Transformation Matrix:**
+
+```
+T_sensor_to_ego = [R  t]     transforms points FROM sensor TO ego
+                  [0  1]
+
+T_ego_to_sensor = T_sensor_to_ego^(-1)    transforms points FROM ego TO sensor
+```
+
+**In nuScenes,** `calibrated_sensor.json` provides `rotation` (as quaternion) and `translation` that represent the sensor-to-ego transformation.
+
+**Quaternion to Rotation Matrix:**
+
+nuScenes stores rotations as quaternions `[w, x, y, z]`. Convert to rotation matrix:
+
+```python
+from pyquaternion import Quaternion
+
+q = Quaternion(w=0.5077, x=-0.4973, y=0.4978, z=-0.4972)
+R = q.rotation_matrix  # 3x3 numpy array
+```
+
+### 4.3 The Full Projection Pipeline (BEVFormer Uses This)
+
+Given a 3D point in the ego frame, project it to pixel coordinates in a specific camera:
+
+```python
+import numpy as np
+
+def project_ego_to_pixel(point_ego, T_sensor_to_ego, K):
+    """
+    Project a 3D point from ego frame to image pixel coordinates.
+    
+    Args:
+        point_ego: [x, y, z] in ego vehicle frame (meters)
+        T_sensor_to_ego: 4x4 transformation (sensor->ego)
+        K: 3x3 camera intrinsic matrix
+    
+    Returns:
+        (u, v): pixel coordinates, or None if behind camera
+    """
+    # Step 1: Ego frame -> Camera frame
+    T_ego_to_sensor = np.linalg.inv(T_sensor_to_ego)
+    point_homo = np.array([*point_ego, 1.0])  # [x, y, z, 1]
+    point_cam = T_ego_to_sensor @ point_homo   # [x_cam, y_cam, z_cam, 1]
+    
+    # Step 2: Check if point is in front of camera
+    if point_cam[2] <= 0:
+        return None  # Behind camera -- invisible
+    
+    # Step 3: Camera frame -> Pixel (perspective projection)
+    point_img = K @ point_cam[:3]  # [u*z, v*z, z]
+    u = point_img[0] / point_img[2]  # perspective divide
+    v = point_img[1] / point_img[2]
+    
+    # Step 4: Check if within image bounds
+    if 0 <= u < 1600 and 0 <= v < 900:
+        return (u, v)
+    else:
+        return None  # Outside image bounds
+```
+
+### 4.4 The Combined lidar2img Matrix
+
+BEVFormer precomputes a single 4x4 matrix that combines ego->camera and camera->pixel in one step. In the code, this is often called `lidar2img` (because the ego frame is aligned with the LiDAR frame in nuScenes):
+
+```python
+# Precomputed for efficiency
+lidar2img = K_4x4 @ T_ego_to_cam  # 4x4 combined projection matrix
+
+# Then projection is just:
+p_homo = lidar2img @ [x, y, z, 1]^T
+u = p_homo[0] / p_homo[2]
+v = p_homo[1] / p_homo[2]
+```
+
+---
+
+## 5. Data Format
+
+### 5.1 Relational Structure
+
+nuScenes uses a relational database structure stored as JSON files. The relationships:
+
+```
+    scene (1000 scenes, ~20 sec each)
+      |
+      +-- has many --> sample (keyframes, 40 per scene at 2 Hz)
+           |
+           +-- has many --> sample_data (one per sensor per frame)
+           |    |
+           |    +-- links to --> calibrated_sensor (calibration for that sensor)
+           |    +-- links to --> ego_pose (vehicle pose at that timestamp)
+           |    +-- has file --> filename (path to image/pointcloud)
+           |
+           +-- has many --> sample_annotation (3D boxes for objects in this frame)
+                |
+                +-- links to --> instance (tracking: same physical object across time)
+                +-- links to --> attribute (behavioral state: moving/parked/etc)
+                +-- links to --> visibility (what fraction is visible)
+```
+
+### 5.2 Key JSON Files
+
+**scene.json** -- Top-level container (one entry per driving scene):
+```json
+{
+    "token": "cc8c0bf57f984915a77078b10eb33198",
+    "log_token": "7e25a2c8ea1f41c5b0dce7b8a0449e7e",
+    "nbr_samples": 39,
+    "first_sample_token": "ca9a282c9e77460f8360f564131a8af5",
+    "last_sample_token": "9fad1d386f3e4a9fb51f259e5fdd3a5f",
+    "name": "scene-0001",
+    "description": "Construction site, rainy weather"
+}
+```
+
+**sample.json** -- A keyframe (synchronized across all sensors):
 ```json
 {
     "token": "ca9a282c9e77460f8360f564131a8af5",
     "timestamp": 1532402927647951,
-    "prev": "39586f9d59004284a7114a68825e8eec",
-    "next": "01fc50f68de944ee9c437b4e235b7d28",
+    "prev": "",
+    "next": "39586f9d59004284a7114a68825e8eec",
     "scene_token": "cc8c0bf57f984915a77078b10eb33198"
 }
 ```
 
-#### sample_data.json
-Links each sensor reading to its file and calibration:
+The `prev` and `next` fields link consecutive keyframes. BEVFormer uses these to find temporal pairs for temporal self-attention.
+
+**sample_data.json** -- Per-sensor data for each timestamp:
 ```json
 {
     "token": "5ace90b379af485b9dcb1584b01e7212",
@@ -218,14 +465,36 @@ Links each sensor reading to its file and calibration:
     "is_key_frame": true,
     "height": 900,
     "width": 1600,
-    "filename": "samples/CAM_FRONT/n015-2018-07-24-11-22-45+0800__CAM_FRONT__1532402927612460.jpg",
-    "prev": "a5e7c5f2e3aa4bcaaa3a70e6a3a2429e",
-    "next": "9b25e0e1064746ed8caa49e0c2e1b859"
+    "filename": "samples/CAM_FRONT/n015-2018-07-24-11-22-45+0800__CAM_FRONT__1532402927612460.jpg"
 }
 ```
 
-#### sample_annotation.json
-3D bounding box annotations for each object instance:
+**calibrated_sensor.json** -- Camera calibration (one per camera-log pair):
+```json
+{
+    "token": "2fde3d3376ea42a8a561df595e001cc7",
+    "sensor_token": "ec4b5d41840a509984f7ec36419d4c09",
+    "translation": [1.70, 0.00, 1.51],
+    "rotation": [0.5077, -0.4973, 0.4978, -0.4972],
+    "camera_intrinsic": [
+        [1266.417, 0.0, 816.267],
+        [0.0, 1266.417, 491.507],
+        [0.0, 0.0, 1.0]
+    ]
+}
+```
+
+**ego_pose.json** -- Vehicle position/orientation at each timestamp:
+```json
+{
+    "token": "5ace90b379af485b9dcb1584b01e7212",
+    "timestamp": 1532402927612460,
+    "rotation": [0.5720, -0.0016, 0.0130, -0.8201],
+    "translation": [410.77, 1137.28, 0.0]
+}
+```
+
+**sample_annotation.json** -- 3D bounding boxes:
 ```json
 {
     "token": "70aecbe9b64f4722ab3c230f9a1d7149",
@@ -244,206 +513,324 @@ Links each sensor reading to its file and calibration:
 }
 ```
 
-#### ego_pose.json
-Vehicle pose at each sensor reading timestamp:
-```json
-{
-    "token": "5ace90b379af485b9dcb1584b01e7212",
-    "timestamp": 1532402927612460,
-    "rotation": [0.5720, -0.0016, 0.0130, -0.8201],
-    "translation": [410.77, 1137.28, 0.0]
-}
-```
+### 5.3 Annotation Format Details
 
-#### calibrated_sensor.json
-Sensor calibration (extrinsics + intrinsics):
-```json
-{
-    "token": "2fde3d3376ea42a8a561df595e001cc7",
-    "sensor_token": "ec4b5d41840a509984f7ec36419d4c09",
-    "translation": [1.70, 0.00, 1.51],
-    "rotation": [0.5077, -0.4973, 0.4978, -0.4972],
-    "camera_intrinsic": [
-        [1266.417, 0.0, 816.267],
-        [0.0, 1266.417, 491.507],
-        [0.0, 0.0, 1.0]
-    ]
-}
-```
+| Field | Format | Meaning |
+|-------|--------|---------|
+| translation | [x, y, z] | Center of box in GLOBAL frame (meters) |
+| size | [w, l, h] | Width, length, height of box (meters) |
+| rotation | [w, x, y, z] | Quaternion orientation in GLOBAL frame |
+| velocity | [vx, vy] | Velocity in GLOBAL frame (m/s), 2D only |
+| num_lidar_pts | int | LiDAR points inside box (0 = fully occluded) |
+| instance_token | str | Unique ID for this physical object across time |
+| prev/next | str | Links to same object in previous/next frame |
+
+**Important notes:**
+- Annotations with `num_lidar_pts=0` are excluded from evaluation (object is fully occluded)
+- `velocity` is only available for keyframes and may be [0,0] for static objects
+- `size` uses [width, length, height] convention (width = shorter dimension)
 
 ---
 
-## 5. Storage Requirements
+## 6. Download Instructions
 
-### 5.1 Full Dataset
+### 6.1 Step-by-Step Download
 
-| Component | Size | Required for BEVFormer? |
-|-----------|------|------------------------|
-| Camera images (samples) | ~70 GB | Yes |
-| Camera images (sweeps) | ~270 GB | Optional (for dense temporal) |
-| LiDAR point clouds | ~50 GB | No (camera-only) |
-| Radar data | ~10 GB | No |
-| Metadata (JSON) | ~300 MB | Yes |
-| Maps | ~2 GB | Optional (for map tasks) |
-| **Total (minimum for BEVFormer)** | **~72 GB** | |
-| **Total (full dataset)** | **~400 GB** | |
+**Step 1: Create Account**
+1. Go to https://www.nuscenes.org/
+2. Click "Sign Up" (free for academic and commercial use)
+3. Accept the Terms of Use
 
-### 5.2 Training Storage Requirements
+**Step 2: Choose What to Download**
 
-Beyond the raw dataset, training BEVFormer requires additional storage:
+For BEVFormer (camera-only), you need:
 
-| Component | Size |
-|-----------|------|
-| Preprocessed info files (pkl) | ~2 GB |
-| Model checkpoints (per epoch) | ~1 GB each |
-| Training logs | ~100 MB |
-| Tensorboard events | ~500 MB |
-| **Recommended free space** | **~100 GB** (dataset + working space) |
+| Archive | Size | Required? | Contains |
+|---------|------|-----------|----------|
+| v1.0-trainval_meta.tgz | ~300 MB | YES | All JSON metadata + annotations |
+| v1.0-trainval01_blobs.tgz through v1.0-trainval10_blobs.tgz | ~70 GB total | YES | Camera images |
+| LiDAR archives | ~50 GB | NO | Point clouds (not needed for BEVFormer) |
+| Radar archives | ~10 GB | NO | Radar data (not needed) |
+| can_bus.zip | ~300 MB | YES | CAN bus data for ego-motion |
+| v1.0-mini.tgz | ~4 GB | OPTIONAL | Small subset for testing |
 
-### 5.3 Storage Recommendations
+**Minimum download for BEVFormer: ~72 GB** (metadata + camera images + can_bus)
 
-- Use **SSD storage** for the dataset directory to avoid I/O bottlenecks during training
-- If using NFS/shared storage, ensure sufficient bandwidth (>1 GB/s)
-- Consider creating symbolic links if dataset and working directories are on different volumes:
-  ```bash
-  ln -s /fast_ssd/nuscenes /data/nuscenes
-  ```
-
----
-
-## 6. Sensor Calibration
-
-### 6.1 Coordinate Systems
-
-nuScenes defines four coordinate systems:
-
-```
-Global Frame (world)
-    |
-    | ego_pose (rotation + translation)
-    v
-Ego Vehicle Frame
-    |
-    | calibrated_sensor (rotation + translation)
-    v
-Sensor Frame (camera/lidar/radar)
-    |
-    | camera_intrinsic (for cameras only)
-    v
-Image Frame (pixels)
-```
-
-All coordinate systems follow a **right-handed** convention:
-- **Global frame:** Fixed world coordinate system (East-North-Up)
-- **Ego frame:** Origin at rear axle center, X-forward, Y-left, Z-up
-- **Camera frame:** X-right, Y-down, Z-forward (standard camera convention)
-- **LiDAR frame:** X-forward, Y-left, Z-up (same as ego)
-
-### 6.2 Intrinsic Calibration
-
-Camera intrinsics define the projection from 3D camera coordinates to 2D pixel coordinates:
-
-```
-K = [fx  0  cx]     3x3 intrinsic matrix
-    [ 0 fy  cy]
-    [ 0  0   1]
-```
-
-| Parameter | Description | Typical Value (CAM_FRONT) |
-|-----------|-------------|--------------------------|
-| fx | Focal length (x) | ~1266 pixels |
-| fy | Focal length (y) | ~1266 pixels |
-| cx | Principal point (x) | ~816 pixels |
-| cy | Principal point (y) | ~491 pixels |
-
-**Note:** nuScenes provides already-undistorted images, so no distortion coefficients are needed.
-
-### 6.3 Extrinsic Calibration
-
-Extrinsics define the transformation from the sensor frame to the ego vehicle frame:
-
-```
-T_ego_sensor = [R | t]     4x4 transformation matrix
-               [0 | 1]
-
-Where:
-  R = 3x3 rotation matrix (from quaternion in calibrated_sensor.json)
-  t = 3x1 translation vector (from translation in calibrated_sensor.json)
-```
-
-#### Computing the Full Projection (3D World to 2D Pixel)
-
-For BEVFormer's spatial cross-attention, the full projection chain is:
-
-```python
-# 1. World to ego
-T_ego_global = np.eye(4)
-T_ego_global[:3, :3] = Quaternion(ego_pose['rotation']).rotation_matrix
-T_ego_global[:3, 3] = ego_pose['translation']
-T_global_ego = np.linalg.inv(T_ego_global)
-
-# 2. Ego to camera
-T_cam_ego = np.eye(4)
-T_cam_ego[:3, :3] = Quaternion(calibrated_sensor['rotation']).rotation_matrix
-T_cam_ego[:3, 3] = calibrated_sensor['translation']
-T_ego_cam = np.linalg.inv(T_cam_ego)
-
-# 3. Full transformation: world to camera
-T_cam_global = T_ego_cam @ T_global_ego
-
-# 4. Project to image
-point_cam = T_cam_global @ point_world_homogeneous
-point_img = K @ point_cam[:3]
-pixel = point_img[:2] / point_img[2]  # Perspective division
-```
-
-### 6.4 Calibration Quality
-
-- nuScenes calibration is performed once per log sequence (not per frame)
-- Calibration accuracy is typically within ~1 pixel reprojection error
-- For BEVFormer, calibration errors propagate to BEV feature misalignment
-- Consider data augmentation that simulates calibration perturbation for robustness
-
-### 6.5 BEVFormer-Specific Calibration Usage
-
-BEVFormer uses calibration in two key places:
-
-1. **Spatial Cross-Attention:** Projects 3D reference points `(x, y, z)` in the BEV grid to 2D pixel locations `(u, v)` in each camera image
-2. **Temporal Self-Attention:** Uses ego-pose difference between consecutive frames to spatially align BEV features
-
-The calibration matrices are typically precomputed and passed as part of the data pipeline metadata (not loaded per-sample during training).
-
----
-
-## 7. Data Quality Considerations
-
-### 7.1 Known Issues
-
-- Some frames have slight timestamp misalignment between cameras (~50ms)
-- A small number of annotations may have incorrect velocity labels
-- Night scenes have lower annotation density due to visibility limitations
-- Some rare object categories have very few training examples
-
-### 7.2 Data Filtering
-
-BEVFormer's data pipeline typically filters:
-- Frames where ego-pose is unavailable or unreliable
-- Samples at the boundaries of scenes (where temporal pairs cannot be formed)
-- Annotations with zero LiDAR points (fully occluded objects, excluded from evaluation)
-
-### 7.3 Recommended Preprocessing
+**Step 3: Download**
 
 ```bash
-# Generate info files for BEVFormer training
+# Create data directory
+mkdir -p /data/nuscenes
+
+# Option A: Browser download (slow but simple)
+# Go to nuscenes.org/download, click each archive, save to /data/nuscenes/
+
+# Option B: Command line (if you have the download links)
+cd /data/nuscenes
+wget <meta_link> -O v1.0-trainval_meta.tgz
+wget <blob01_link> -O v1.0-trainval01_blobs.tgz
+# ... repeat for all blob archives
+
+# Option C: nuScenes devkit
+pip install nuscenes-devkit
+python -c "
+from nuscenes.utils.download import download
+download('v1.0-trainval', '/data/nuscenes')
+"
+```
+
+**Step 4: Extract**
+
+```bash
+cd /data/nuscenes
+
+# Extract metadata (annotations, calibration, etc.)
+tar -xzf v1.0-trainval_meta.tgz
+
+# Extract camera images (one archive at a time to manage disk space)
+for i in $(seq -w 1 10); do
+    tar -xzf v1.0-trainval${i}_blobs.tgz
+    echo "Extracted blob archive ${i}"
+done
+
+# Extract CAN bus data
+unzip can_bus.zip
+```
+
+**Step 5: Verify**
+
+```bash
+# Check directory structure
+ls /data/nuscenes/
+# Expected: maps/ samples/ sweeps/ v1.0-trainval/ can_bus/
+
+# Check camera images exist
+ls /data/nuscenes/samples/CAM_FRONT/ | head -5
+# Expected: n008-2018-05-21-11-06-59-0400__CAM_FRONT__1526915243012465.jpg ...
+
+# Count images (should be ~40,000 keyframes x 6 cameras = ~240,000)
+find /data/nuscenes/samples/CAM_* -name "*.jpg" | wc -l
+# Expected: approximately 240,000
+
+# Verify metadata
+python -c "
+from nuscenes import NuScenes
+nusc = NuScenes(version='v1.0-trainval', dataroot='/data/nuscenes')
+print(f'Scenes: {len(nusc.scene)}')
+print(f'Samples: {len(nusc.sample)}')
+print(f'Sample data: {len(nusc.sample_data)}')
+"
+# Expected: Scenes: 1000, Samples: ~40000, Sample data: ~400000+
+```
+
+---
+
+## 7. Data Splits
+
+### 7.1 Official Splits
+
+| Split | Scenes | Keyframes | Purpose |
+|-------|--------|-----------|---------|
+| Train | 700 | ~28,130 | Model training |
+| Validation | 150 | ~6,019 | Local evaluation, hyperparameter tuning |
+| Test | 150 | ~6,008 | Leaderboard submission only (no local eval) |
+
+### 7.2 Mini Split (for Development)
+
+| Split | Scenes | Keyframes | Purpose |
+|-------|--------|-----------|---------|
+| Mini-train | 7 | ~283 | Quick code verification |
+| Mini-val | 3 | ~123 | Quick evaluation test |
+
+Use the mini split to verify your data pipeline works before downloading 70+ GB.
+
+### 7.3 Geographic Diversity
+
+- **Boston scenes:** Urban driving, typical US road infrastructure
+- **Singapore scenes:** Dense urban, different driving conventions (left-hand drive), tropical weather
+
+The splits are geographically balanced -- both cities appear in train, val, and test.
+
+---
+
+## 8. CAN Bus Data (Ego-Motion)
+
+### 8.1 What Is CAN Bus?
+
+CAN (Controller Area Network) is the internal communication bus in modern vehicles. It carries real-time data from the vehicle's sensors: wheel speed, steering angle, accelerometer, gyroscope, GPS, etc.
+
+### 8.2 Why BEVFormer Needs It
+
+BEVFormer's temporal self-attention must align previous BEV features to the current frame. This requires knowing exactly how the ego vehicle moved between frames. The CAN bus provides precise ego-motion information (translation + rotation).
+
+### 8.3 What nuScenes Provides
+
+The `can_bus` expansion pack provides 18-dimensional vectors per frame:
+
+```python
+can_bus = np.array([
+    x, y, z,           # Global position (meters)
+    qw, qx, qy, qz,   # Global orientation (quaternion)
+    vx, vy, vz,        # Linear velocity (m/s)
+    ax, ay, az,         # Linear acceleration (m/s^2)
+    wx, wy, wz,         # Angular velocity (rad/s)
+    speed               # Scalar speed (m/s)
+])  # shape: (18,)
+```
+
+### 8.4 Download and Integration
+
+```bash
+# Download CAN bus data
+wget https://www.nuscenes.org/data/can_bus.zip
+unzip can_bus.zip -d /data/nuscenes/
+
+# Verify
+ls /data/nuscenes/can_bus/
+# Expected: scene-0001.json, scene-0002.json, ...
+```
+
+---
+
+## 9. Data Preprocessing for BEVFormer
+
+### 9.1 Generating Info Files
+
+BEVFormer requires preprocessed pickle files that combine all metadata into an efficient format:
+
+```bash
 python tools/create_data.py nuscenes \
     --root-path /data/nuscenes \
     --out-dir /data/nuscenes \
     --extra-tag nuscenes \
     --version v1.0-trainval \
     --canbus /data/nuscenes
+
+# Output files:
+#   /data/nuscenes/nuscenes_infos_temporal_train.pkl  (~1.5 GB)
+#   /data/nuscenes/nuscenes_infos_temporal_val.pkl    (~0.3 GB)
 ```
 
-This creates pickle files containing:
-- Per-sample metadata (calibration, ego-pose, file paths)
-- Annotation data in a format ready for the data loader
-- Temporal sample pairs for consecutive frame loading
+### 9.2 What the Info Files Contain
+
+Each entry in the info pickle represents one keyframe and contains:
+
+```python
+info = {
+    'lidar_path': str,              # Reference path (for token matching)
+    'token': str,                   # Unique sample identifier
+    'cams': {                       # Per-camera information
+        'CAM_FRONT': {
+            'data_path': str,       # Path to JPEG image
+            'sensor2ego_translation': [3],   # Camera position in ego frame
+            'sensor2ego_rotation': [4],      # Camera orientation (quaternion)
+            'ego2global_translation': [3],   # Ego position in global frame
+            'ego2global_rotation': [4],      # Ego orientation (quaternion)
+            'cam_intrinsic': [[3,3]],        # 3x3 intrinsic matrix
+        },
+        'CAM_FRONT_LEFT': {...},
+        'CAM_FRONT_RIGHT': {...},
+        'CAM_BACK': {...},
+        'CAM_BACK_LEFT': {...},
+        'CAM_BACK_RIGHT': {...},
+    },
+    'gt_boxes': np.array,           # (N, 9): [x,y,z,w,l,h,yaw,vx,vy] in ego frame
+    'gt_names': np.array,           # (N,) class names
+    'num_lidar_pts': np.array,      # (N,) LiDAR points per object
+    'valid_flag': np.array,         # (N,) boolean: has enough points to evaluate?
+    'prev': str,                    # Token of previous keyframe (for temporal)
+    'next': str,                    # Token of next keyframe
+    'can_bus': np.array,            # (18,) CAN bus data
+}
+```
+
+### 9.3 How Temporal Pairs Are Formed
+
+BEVFormer loads multiple consecutive frames. During data loading:
+
+```python
+# For current sample at time t:
+#   Load current frame info
+#   Follow 'prev' tokens to get previous frames: t-1, t-2, t-3
+#   Each previous frame provides:
+#     - ego_pose (for alignment transformation)
+#     - This is used to compute the ego-motion matrix between frames
+#
+# The model processes these as a temporal queue:
+#   queue = [frame_t-3, frame_t-2, frame_t-1, frame_t]
+#   The BEV from t-1 is cached and aligned to t using ego-motion
+```
+
+---
+
+## 10. Data Quality Considerations
+
+### 10.1 Known Issues
+
+1. **Timestamp misalignment:** Cameras are not perfectly synchronized. There can be up to ~50ms offset between cameras in the same keyframe. For a car moving at 30 m/s, this is ~1.5m of motion.
+
+2. **Velocity label noise:** Some velocity annotations are derived from tracking and may be noisy, especially for objects that appear/disappear between frames.
+
+3. **Night scene annotation density:** Fewer annotations in very dark scenes because human annotators cannot see occluded objects.
+
+4. **Calibration stability:** Calibration is per-log (one driving session), not per-frame. Minor vibrations during driving are not accounted for.
+
+### 10.2 Data Filtering in BEVFormer
+
+The BEVFormer data pipeline filters:
+- Annotations with `num_lidar_pts=0` (fully occluded, not evaluatable)
+- Annotations outside the point cloud range `[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]`
+- First frames of scenes (no previous frame for temporal)
+- Corrupt or missing images (rare)
+
+### 10.3 Class Distribution (Imbalance)
+
+```
+Class                  # Train Annotations  Relative Frequency
+car                    ~340,000             ████████████████████  48.6%
+pedestrian             ~160,000             ████████████          22.9%
+barrier                ~120,000             █████████             17.1%
+traffic_cone           ~ 70,000             █████                 10.0%
+truck                  ~ 65,000             █████                  9.3%
+trailer                ~ 20,000             ██                     2.9%
+motorcycle             ~ 15,000             █                      2.1%
+bus                    ~ 12,000             █                      1.7%
+bicycle                ~ 10,000             █                      1.4%
+construction_vehicle   ~  7,000             █                      1.0%
+```
+
+The 48x imbalance between `car` and `construction_vehicle` motivates the use of class-balanced sampling (CBGS) during training.
+
+---
+
+## 11. Storage and Performance Recommendations
+
+### 11.1 Storage Requirements
+
+| Component | Size | Required? |
+|-----------|------|-----------|
+| Camera keyframes (samples/) | ~35 GB | Yes |
+| Camera sweeps (sweeps/) | ~240 GB | Optional (denser temporal) |
+| Metadata JSON | ~300 MB | Yes |
+| CAN bus | ~300 MB | Yes |
+| Preprocessed info files | ~2 GB | Generated locally |
+| Model checkpoints | ~1 GB each | Generated during training |
+| **Minimum total** | **~40 GB** | |
+| **Recommended free space** | **~100 GB** | (includes working room) |
+
+### 11.2 I/O Performance
+
+BEVFormer loads 6 images per sample (each ~200KB JPEG). At batch_size=1 with 4 temporal frames, that is 24 image reads per iteration.
+
+**Recommendations:**
+- Use SSD storage (not HDD) -- random reads of 200KB files benefit enormously from SSD
+- If using network storage (NFS), ensure >1 GB/s bandwidth
+- Enable `persistent_workers=True` in dataloader to avoid re-spawning processes
+- Use `num_workers=4` per GPU (increase if I/O is the bottleneck)
+
+```bash
+# Check if I/O is your bottleneck:
+# If GPU utilization < 90% during training, I/O is likely the issue
+nvidia-smi  # Check GPU utilization during training
+iostat -x 1  # Check disk I/O saturation
+```
