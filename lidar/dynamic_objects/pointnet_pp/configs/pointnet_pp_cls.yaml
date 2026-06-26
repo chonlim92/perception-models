@@ -1,0 +1,197 @@
+# PointNet++ Classification Configuration
+# Task: 3D shape classification (ModelNet40)
+# Reference: Qi et al., "PointNet++: Deep Hierarchical Feature Learning on Point Sets
+#            in a Metric Space", NeurIPS 2017
+
+# =============================================================================
+# Model Parameters
+# =============================================================================
+model:
+  name: pointnet_pp_cls_msg
+  type: classification
+  num_classes: 40
+  use_normals: true  # Use surface normals as additional input features
+  input_channels: 6  # XYZ + normal_x, normal_y, normal_z (3+3=6)
+
+  # Input point cloud
+  npoints: 1024
+
+  # Set Abstraction layers (Multi-Scale Grouping)
+  sa_layers:
+    - name: sa1
+      npoint: 512
+      msg:
+        - radius: 0.1
+          nsample: 16
+          mlp: [32, 32, 64]
+        - radius: 0.2
+          nsample: 32
+          mlp: [64, 64, 128]
+        - radius: 0.4
+          nsample: 128
+          mlp: [64, 96, 128]
+      # Output feature dim: 64 + 128 + 128 = 320
+
+    - name: sa2
+      npoint: 128
+      msg:
+        - radius: 0.2
+          nsample: 32
+          mlp: [64, 64, 128]
+        - radius: 0.4
+          nsample: 64
+          mlp: [128, 128, 256]
+        - radius: 0.8
+          nsample: 128
+          mlp: [128, 128, 256]
+      # Output feature dim: 128 + 256 + 256 = 640
+
+    - name: sa3_global
+      npoint: null  # Global aggregation (all points)
+      group_all: true
+      mlp: [256, 512, 1024]
+      # Output feature dim: 1024
+
+  # Classification head (fully connected layers)
+  classifier:
+    - out_features: 512
+      batch_norm: true
+      activation: relu
+      dropout: 0.4
+    - out_features: 256
+      batch_norm: true
+      activation: relu
+      dropout: 0.5
+    - out_features: 40  # num_classes
+      batch_norm: false
+      activation: null
+      dropout: 0.0
+
+# =============================================================================
+# Training Parameters
+# =============================================================================
+training:
+  epochs: 200
+  batch_size: 24
+  num_workers: 8
+  pin_memory: true
+
+  # Optimizer
+  optimizer:
+    type: adam
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 1.0e-4
+
+  # Learning rate schedule
+  scheduler:
+    type: step_lr
+    step_size: 20
+    gamma: 0.7
+    # LR at epoch 0: 0.001
+    # LR at epoch 20: 0.0007
+    # LR at epoch 40: 0.00049
+    # LR at epoch 60: 0.000343
+    # LR at epoch 100: 0.000168
+
+  # Loss function
+  loss:
+    type: cross_entropy
+    label_smoothing: 0.0
+
+  # Gradient clipping
+  grad_clip:
+    max_norm: 10.0
+
+  # Mixed precision training
+  amp:
+    enabled: true
+
+  # Checkpointing
+  checkpoint:
+    save_interval: 10  # Save every 10 epochs
+    save_best: true
+    metric: accuracy
+    mode: max
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 30
+    min_delta: 0.001
+
+# =============================================================================
+# Data Parameters
+# =============================================================================
+data:
+  dataset: modelnet40
+  root_dir: ./data/modelnet40_normal_resampled
+
+  # Point cloud preprocessing
+  npoints: 1024
+  use_normals: true
+  normalize: true  # Normalize to unit sphere
+
+  # Train/test split
+  train_split: train
+  test_split: test
+  num_train_samples: 9843
+  num_test_samples: 2468
+
+  # Augmentation (training only)
+  augmentation:
+    random_rotation:
+      enabled: true
+      axis: z  # Rotate around vertical axis
+      angle_range: [-3.141593, 3.141593]  # Full 360 degrees
+
+    random_scale:
+      enabled: true
+      scale_range: [0.8, 1.2]
+
+    point_jitter:
+      enabled: true
+      sigma: 0.01
+      clip: 0.05
+
+    random_dropout:
+      enabled: true  # Critical for MSG variant
+      max_ratio: 0.875
+
+    random_shift:
+      enabled: true
+      shift_range: 0.1
+
+# =============================================================================
+# Evaluation Parameters
+# =============================================================================
+evaluation:
+  batch_size: 32
+  num_votes: 1  # Set to 10+ for voting-based test-time augmentation
+  metrics:
+    - overall_accuracy
+    - mean_class_accuracy
+    - per_class_accuracy
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  log_dir: ./logs/pointnet_pp_cls
+  log_interval: 10  # Log every N batches
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: pointnet_pp_classification
+    entity: null
+
+# =============================================================================
+# Hardware
+# =============================================================================
+hardware:
+  gpus: [0]
+  distributed: false
+  sync_bn: false
+  seed: 42
+  deterministic: false  # Set true for reproducibility (slower)

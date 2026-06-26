@@ -1,0 +1,173 @@
+# Cylinder3D Configuration for SemanticKITTI Dataset
+# Reference: "Cylindrical and Asymmetrical 3D Convolution Networks for LiDAR Segmentation"
+# Paper: https://arxiv.org/abs/2011.10033
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+model:
+  name: "Cylinder3D"
+  num_classes: 20
+  input_dims: 9  # x, y, z, intensity, r, theta, z_cyl, x_norm, y_norm
+  ignore_label: 0
+
+# ==============================================================================
+# Cylindrical Partition
+# ==============================================================================
+cylindrical_partition:
+  grid_size: [480, 360, 32]  # [rho, theta, z]
+  bounds:
+    rho: [0, 50]           # radial distance in meters
+    theta: [-3.14159265, 3.14159265]  # full 360 degrees
+    z: [-3, 1]             # height range in meters
+
+# ==============================================================================
+# Backbone Configuration
+# ==============================================================================
+backbone:
+  type: "asymmetrical_3d_spconv"
+  init_channels: 32
+  encoder:
+    channels: [64, 128, 256, 256]
+    layers: [2, 2, 2, 2]
+    stride: [1, 2, 2, 2]
+  decoder:
+    channels: [256, 128, 64, 32]
+    layers: [2, 2, 2, 2]
+  dropout: 0.3
+  use_attention: true
+
+# Point-wise head
+point_head:
+  channels: [64, 32]
+  dropout: 0.1
+
+# ==============================================================================
+# Training Configuration
+# ==============================================================================
+training:
+  batch_size: 2
+  epochs: 40
+  optimizer:
+    type: "adam"
+    lr: 0.001
+    weight_decay: 0.0001
+    betas: [0.9, 0.99]
+  scheduler:
+    type: "cosine_annealing"
+    T_max: 40
+    eta_min: 0.00001
+  grad_clip: 10.0
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: true
+
+# ==============================================================================
+# Loss Configuration
+# ==============================================================================
+loss:
+  ce_weight: 1.0
+  lovasz_weight: 1.0
+  # Class weights for SemanticKITTI (20 classes)
+  # 0: unlabeled, 1: car, 2: bicycle, 3: motorcycle, 4: truck,
+  # 5: other-vehicle, 6: person, 7: bicyclist, 8: motorcyclist, 9: road,
+  # 10: parking, 11: sidewalk, 12: other-ground, 13: building, 14: fence,
+  # 15: vegetation, 16: trunk, 17: terrain, 18: pole, 19: traffic-sign
+  class_weights:
+    - 0.0     # unlabeled (ignored)
+    - 2.303   # car
+    - 6.908   # bicycle
+    - 6.908   # motorcycle
+    - 4.605   # truck
+    - 5.298   # other-vehicle
+    - 6.215   # person
+    - 6.908   # bicyclist
+    - 6.908   # motorcyclist
+    - 1.099   # road
+    - 3.912   # parking
+    - 2.303   # sidewalk
+    - 4.605   # other-ground
+    - 1.609   # building
+    - 3.219   # fence
+    - 1.386   # vegetation
+    - 3.912   # trunk
+    - 2.079   # terrain
+    - 4.605   # pole
+    - 5.298   # traffic-sign
+
+# ==============================================================================
+# Data Augmentation
+# ==============================================================================
+augmentation:
+  rotation:
+    enabled: true
+    range: [-3.14159265, 3.14159265]  # full rotation around z-axis
+  flip:
+    enabled: true
+    axes: ["x", "y"]
+    probability: 0.5
+  scale:
+    enabled: true
+    range: [0.95, 1.05]
+  translate:
+    enabled: true
+    range: [0.1, 0.1, 0.1]  # [x, y, z] in meters
+  random_drop:
+    enabled: true
+    max_ratio: 0.1
+  jitter:
+    enabled: false
+    sigma: 0.01
+    clip: 0.05
+
+# ==============================================================================
+# Dataset Configuration
+# ==============================================================================
+dataset:
+  name: "SemanticKITTI"
+  root_dir: "/data/semantickitti/dataset/sequences"
+  label_mapping: "configs/label_mapping/semantic-kitti.yaml"
+  split:
+    train: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
+    val: [8]
+    test: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+  num_points: -1  # use all points
+  return_ref: true  # return remission/intensity
+
+# ==============================================================================
+# Evaluation Configuration
+# ==============================================================================
+evaluation:
+  metrics: ["miou", "iou_per_class", "accuracy"]
+  eval_frequency: 1  # evaluate every N epochs
+  save_best: true
+  best_metric: "miou"
+  test_time_augmentation:
+    enabled: false
+    rotations: [0, 1.5708, 3.14159, 4.71239]  # 0, 90, 180, 270 degrees
+    flips: [false, true]
+
+# ==============================================================================
+# Checkpoint and Logging
+# ==============================================================================
+checkpoint:
+  save_dir: "checkpoints/cylinder3d_semantickitti"
+  save_frequency: 5  # save every N epochs
+  resume: null  # path to resume checkpoint
+
+logging:
+  log_dir: "logs/cylinder3d_semantickitti"
+  log_frequency: 10  # log every N iterations
+  use_tensorboard: true
+  use_wandb: false
+  wandb_project: "cylinder3d"
+  wandb_entity: null
+
+# ==============================================================================
+# Inference Configuration
+# ==============================================================================
+inference:
+  checkpoint: "checkpoints/cylinder3d_semantickitti/best_model.pth"
+  output_dir: "predictions/semantickitti"
+  save_predictions: true
+  visualization: false

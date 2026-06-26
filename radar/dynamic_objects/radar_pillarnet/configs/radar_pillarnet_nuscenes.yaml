@@ -1,0 +1,205 @@
+# RadarPillarNet Configuration for nuScenes Dataset
+# Radar-based 3D object detection using pillar-based feature encoding
+
+model:
+  name: RadarPillarNet
+
+  pillar_encoder:
+    point_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+    pillar_size: [0.4, 0.4, 8.0]
+    max_points_per_pillar: 20
+    max_pillars: 12000
+    num_input_features: 9
+    num_output_features: 64
+
+  backbone:
+    layer_nums: [3, 5, 5]
+    layer_strides: [1, 2, 2]
+    num_filters: [64, 128, 256]
+    upsample_strides: [1, 2, 4]
+    num_upsample_filters: [128, 128, 128]
+
+  head:
+    num_classes: 10
+    class_names:
+      - car
+      - truck
+      - bus
+      - trailer
+      - construction_vehicle
+      - pedestrian
+      - motorcycle
+      - bicycle
+      - traffic_cone
+      - barrier
+
+    anchors:
+      - class_name: car
+        sizes: [4.7, 2.1, 1.7]
+        rotations: [0, 1.5708]
+        height_offset: -1.0
+        matched_threshold: 0.6
+        unmatched_threshold: 0.45
+
+      - class_name: truck
+        sizes: [6.93, 2.51, 2.84]
+        rotations: [0, 1.5708]
+        height_offset: -0.2
+        matched_threshold: 0.55
+        unmatched_threshold: 0.4
+
+      - class_name: bus
+        sizes: [10.5, 2.94, 3.47]
+        rotations: [0, 1.5708]
+        height_offset: -0.1
+        matched_threshold: 0.55
+        unmatched_threshold: 0.4
+
+      - class_name: trailer
+        sizes: [12.29, 2.90, 3.87]
+        rotations: [0, 1.5708]
+        height_offset: 0.0
+        matched_threshold: 0.5
+        unmatched_threshold: 0.35
+
+      - class_name: construction_vehicle
+        sizes: [6.37, 2.85, 3.19]
+        rotations: [0, 1.5708]
+        height_offset: -0.2
+        matched_threshold: 0.5
+        unmatched_threshold: 0.35
+
+      - class_name: pedestrian
+        sizes: [0.73, 0.67, 1.77]
+        rotations: [0, 1.5708]
+        height_offset: -0.95
+        matched_threshold: 0.6
+        unmatched_threshold: 0.4
+
+      - class_name: motorcycle
+        sizes: [2.11, 0.77, 1.47]
+        rotations: [0, 1.5708]
+        height_offset: -1.1
+        matched_threshold: 0.5
+        unmatched_threshold: 0.3
+
+      - class_name: bicycle
+        sizes: [1.70, 0.60, 1.28]
+        rotations: [0, 1.5708]
+        height_offset: -1.2
+        matched_threshold: 0.5
+        unmatched_threshold: 0.3
+
+      - class_name: traffic_cone
+        sizes: [0.41, 0.41, 1.07]
+        rotations: [0]
+        height_offset: -1.4
+        matched_threshold: 0.6
+        unmatched_threshold: 0.4
+
+      - class_name: barrier
+        sizes: [2.53, 0.60, 0.98]
+        rotations: [0, 1.5708]
+        height_offset: -1.4
+        matched_threshold: 0.55
+        unmatched_threshold: 0.4
+
+    nms_threshold: 0.2
+    score_threshold: 0.1
+    max_detections: 500
+
+data:
+  dataset: nuscenes
+  root_path: /data/nuscenes
+  version: v1.0-trainval
+  num_sweeps: 6
+
+  point_features:
+    - x
+    - y
+    - z
+    - rcs
+    - vr_compensated
+    - time_lag
+
+  train_split: train
+  val_split: val
+  test_split: test
+
+  augmentation:
+    flip:
+      enabled: true
+      probability: 0.5
+      axes: [x, y]
+
+    rotation:
+      enabled: true
+      range: [-0.7854, 0.7854]
+
+    scaling:
+      enabled: true
+      range: [0.95, 1.05]
+
+    gt_sampling:
+      enabled: true
+      database_path: /data/nuscenes/gt_database
+      min_points_per_object:
+        car: 5
+        truck: 5
+        bus: 5
+        trailer: 5
+        construction_vehicle: 5
+        pedestrian: 2
+        motorcycle: 3
+        bicycle: 3
+        traffic_cone: 2
+        barrier: 3
+      sample_groups:
+        car: 3
+        truck: 3
+        bus: 4
+        trailer: 4
+        construction_vehicle: 5
+        pedestrian: 2
+        motorcycle: 5
+        bicycle: 5
+        traffic_cone: 2
+        barrier: 3
+
+training:
+  batch_size: 4
+  epochs: 80
+  num_workers: 4
+  seed: 42
+
+  optimizer:
+    type: adamw
+    lr: 0.002
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: one_cycle
+    max_lr: 0.002
+    pct_start: 0.4
+    anneal_strategy: cos
+    div_factor: 10.0
+    final_div_factor: 100.0
+
+  grad_clip_norm: 35.0
+
+  loss_weights:
+    cls: 1.0
+    reg: 2.0
+    vel: 0.2
+    dir: 0.2
+
+  checkpoint:
+    save_interval: 5
+    keep_last: 5
+
+evaluation:
+  nms_threshold: 0.2
+  score_threshold: 0.1
+  eval_metric: nuscenes_detection_score
+  distance_thresholds: [0.5, 1.0, 2.0, 4.0]

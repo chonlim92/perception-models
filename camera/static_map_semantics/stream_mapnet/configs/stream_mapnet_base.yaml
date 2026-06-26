@@ -1,0 +1,290 @@
+# =============================================================================
+# StreamMapNet Base Configuration
+# =============================================================================
+# Online HD Map Construction via Vectorized Temporal Fusion
+# This config defines the base model architecture, training hyperparameters,
+# and data pipeline settings. Dataset-specific overrides should inherit from
+# this file.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  type: "StreamMapNet"
+
+  # --- Image Backbone ---
+  # ResNet-50 pretrained on ImageNet for multi-view feature extraction
+  backbone:
+    type: "ResNet"
+    depth: 50
+    num_stages: 4
+    out_indices: [1, 2, 3]  # C3, C4, C5 (stride 8, 16, 32)
+    frozen_stages: 1         # Freeze stem + stage1 for stable early training
+    norm_cfg:
+      type: "BN2d"
+      requires_grad: true
+    norm_eval: true
+    style: "pytorch"
+    pretrained: "torchvision://resnet50"
+
+  # --- Feature Pyramid Neck ---
+  # FPN aggregates multi-scale features for BEV transformation
+  neck:
+    type: "FPN"
+    in_channels: [512, 1024, 2048]   # C3, C4, C5 channel dims
+    out_channels: 256
+    start_level: 0
+    num_outs: 3
+    add_extra_convs: "on_output"
+    relu_before_extra_convs: true
+
+  # --- BEV Transform (Lift-Splat-Shoot) ---
+  # Projects 2D image features into 3D frustum then collapses to BEV plane
+  bev_transform:
+    type: "LSS"
+    # Depth distribution parameters
+    depth_cfg:
+      min_depth: 1.0       # meters - minimum depth prediction
+      max_depth: 60.0      # meters - maximum depth prediction
+      depth_interval: 1.0  # meters - uniform depth bin spacing
+      num_depth_bins: 59   # (max - min) / interval
+    # Frustum grid dimensions for voxel pooling
+    frustum_grid:
+      depth_size: 59       # matches num_depth_bins
+      height_size: 8       # vertical frustum resolution
+      width_size: 22       # horizontal frustum resolution
+    # BEV grid resolution
+    bev_grid:
+      x_size: 200          # longitudinal grid cells
+      y_size: 100          # lateral grid cells
+      resolution: 0.3      # meters per pixel
+    # Depth net: predicts per-pixel depth distribution
+    depth_net:
+      in_channels: 256
+      mid_channels: 256
+      out_channels: 59     # one logit per depth bin
+      use_dcn: false
+    # BEV encoder: refines raw BEV features
+    bev_encoder:
+      in_channels: 256
+      out_channels: 256
+      num_layers: 2
+      kernel_size: 3
+
+  # --- Temporal Fusion Module ---
+  # Aggregates BEV features across multiple frames via motion-aware propagation
+  temporal_fusion:
+    type: "TemporalSelfAttention"
+    window_size: 8               # number of historical frames to fuse
+    propagation_method: "warp"   # 'warp' uses ego-motion compensation
+    # Deformable attention for temporal alignment
+    attention:
+      num_heads: 8
+      hidden_dim: 256
+      num_levels: 1
+      num_points: 4              # sampling points per attention head
+      dropout: 0.1
+    # Feature aggregation after attention
+    ffn:
+      hidden_dim: 512
+      dropout: 0.1
+      activation: "relu"
+    # Ego-motion compensation
+    ego_motion:
+      use_ego_motion: true       # warp historical BEV using ego poses
+      compensation_method: "affine"  # affine transform for BEV warping
+
+  # --- Map Element Decoder ---
+  # Transformer decoder that predicts vectorized map elements as point sets
+  map_decoder:
+    type: "MapElementDecoder"
+    # Query configuration
+    num_queries: 150             # total queries (50 per class x 3 classes)
+    queries_per_class: 50       # balanced allocation across map classes
+    num_points_per_query: 20    # polyline vertices per predicted element
+    # Transformer decoder layers
+    num_decoder_layers: 6
+    hidden_dim: 256
+    num_heads: 8
+    ffn_dim: 512
+    dropout: 0.1
+    activation: "relu"
+    # Iterative point refinement
+    iterative_refinement: true
+    # Classification head
+    cls_head:
+      in_channels: 256
+      num_classes: 3            # lane_divider, road_boundary, ped_crossing
+    # Point regression head
+    point_head:
+      in_channels: 256
+      num_points: 20
+      output_dim: 2             # (x, y) normalized coordinates
+    # Direction head for polyline orientation
+    direction_head:
+      in_channels: 256
+      output_dim: 2             # direction vector (dx, dy)
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Hungarian matching cost weights (for bipartite assignment)
+  matching_cost:
+    cls_weight: 2.0             # classification cost weight
+    point_weight: 5.0           # point-to-point L1 distance weight
+    direction_weight: 1.0       # direction consistency weight
+
+  # Training loss weights
+  loss_weights:
+    cls_loss: 2.0               # focal loss for classification
+    point_loss: 5.0             # L1 loss for point coordinates
+    direction_loss: 0.5         # cosine similarity loss for direction
+    edge_loss: 1.0              # smoothness regularization on polylines
+
+  # Focal loss parameters for classification
+  focal_loss:
+    alpha: 0.25
+    gamma: 2.0
+
+  # Auxiliary losses from intermediate decoder layers
+  auxiliary_loss: true
+  aux_loss_weight: 0.5         # scale factor for intermediate layer losses
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Optimizer
+  optimizer:
+    type: "AdamW"
+    lr: 2.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    # Layer-wise learning rate decay for backbone
+    paramwise_cfg:
+      backbone_lr_mult: 0.1    # backbone learns 10x slower than head
+
+  # Learning rate scheduler
+  scheduler:
+    type: "CosineAnnealingLR"
+    warmup:
+      type: "linear"
+      warmup_iters: 500
+      warmup_ratio: 0.001
+    min_lr_ratio: 0.01         # final lr = initial_lr * min_lr_ratio
+
+  # Training duration
+  epochs: 24
+  batch_size: 4                # per GPU
+  num_workers: 4               # dataloader workers per GPU
+  accumulate_grad_batches: 1
+
+  # Gradient clipping
+  grad_clip:
+    max_norm: 35.0
+    norm_type: 2
+
+  # Mixed precision training
+  fp16:
+    enabled: true
+    loss_scale: "dynamic"
+
+  # Checkpoint and logging
+  checkpoint:
+    interval: 1                # save every N epochs
+    max_keep: 5                # keep last N checkpoints
+  log_interval: 50             # log every N iterations
+
+  # Distributed training
+  dist:
+    backend: "nccl"
+    find_unused_parameters: true
+
+# -----------------------------------------------------------------------------
+# Data Pipeline Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Input image settings
+  img_size: [256, 704]         # (H, W) after resize
+  num_cameras: 6               # surround-view camera count
+
+  # Map semantic classes
+  map_classes:
+    - "lane_divider"
+    - "road_boundary"
+    - "ped_crossing"
+  num_classes: 3
+
+  # BEV perception range (meters, centered on ego vehicle)
+  bev_range:
+    x: [-30.0, 30.0]          # longitudinal (front/back)
+    y: [-15.0, 15.0]          # lateral (left/right)
+
+  # Temporal sequence settings
+  temporal:
+    window_size: 8             # number of frames in temporal window
+    frame_interval: 1          # sample every Nth frame
+    drop_history_prob: 0.2     # probability of masking history (training only)
+
+  # Normalization (ImageNet statistics)
+  img_norm_cfg:
+    mean: [123.675, 116.28, 103.53]
+    std: [58.395, 57.12, 57.375]
+    to_rgb: true
+
+  # Data augmentation (training only)
+  augmentation:
+    # Image-level augmentations
+    image:
+      random_resize:
+        scale_range: [0.9, 1.1]
+      random_crop:
+        crop_size: [256, 704]
+      random_flip:
+        horizontal_prob: 0.5
+      color_jitter:
+        brightness: 0.2
+        contrast: 0.2
+        saturation: 0.2
+        hue: 0.1
+      grid_mask:
+        enabled: true
+        ratio: 0.5
+        prob: 0.7
+    # BEV-level augmentations
+    bev:
+      random_rotate:
+        angle_range: [-5.4, 5.4]  # degrees
+      random_scale:
+        scale_range: [0.95, 1.05]
+      random_flip:
+        horizontal_prob: 0.5
+
+  # Map element processing
+  map_processing:
+    # Fixed number of points per polyline (interpolation/subsampling)
+    fixed_num_points: 20
+    # Padding value for shorter polylines
+    padding_value: -10000.0
+    # Minimum polyline length to keep (meters)
+    min_length: 1.0
+    # Simplification tolerance (Douglas-Peucker, meters)
+    simplify_tolerance: 0.2
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  # Chamfer distance thresholds for AP computation (meters)
+  cd_thresholds: [0.5, 1.0, 1.5]
+  # Primary metric
+  primary_metric: "mAP"
+  # Evaluation interval
+  eval_interval: 1             # evaluate every N epochs
+  # Visualization
+  visualization:
+    enabled: false
+    save_dir: "work_dirs/vis"
+    max_samples: 20

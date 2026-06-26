@@ -1,0 +1,245 @@
+# =============================================================================
+# RangeNet++ DarkNet-53 Backbone Configuration
+# Paper: "RangeNet++: Fast and Accurate LiDAR Semantic Segmentation"
+# Authors: Milioto et al., IROS 2019
+#
+# This config specifies the DarkNet-53 encoder architecture details,
+# U-Net decoder structure, and model-specific hyperparameters.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  name: "RangeNet53++"
+  backbone: "darknet53"
+  num_classes: 20               # 19 semantic + 1 unlabeled
+  input_channels: 5             # [range, x, y, z, intensity]
+  dropout_rate: 0.01            # Before classification head
+
+# -----------------------------------------------------------------------------
+# DarkNet-53 Encoder
+# -----------------------------------------------------------------------------
+encoder:
+  name: "DarkNet-53"
+
+  # Initial convolution
+  stem:
+    out_channels: 32
+    kernel_size: 3
+    stride: 1
+    padding: 1
+    bias: false
+    batch_norm: true
+    activation: "leaky_relu"
+    leaky_slope: 0.1
+
+  # Encoder blocks (5 stages of downsampling)
+  # Each stage: one strided conv (downsample) + N residual blocks
+  stages:
+    - name: "stage_1"
+      downsample_channels: 64
+      num_residual_blocks: 1
+      channels: [32, 64]        # [bottleneck, output] per residual block
+      stride: 2
+      output_size: [32, 1024]   # H x W after this stage
+
+    - name: "stage_2"
+      downsample_channels: 128
+      num_residual_blocks: 2
+      channels: [64, 128]
+      stride: 2
+      output_size: [16, 512]
+
+    - name: "stage_3"
+      downsample_channels: 256
+      num_residual_blocks: 8
+      channels: [128, 256]
+      stride: 2
+      output_size: [8, 256]
+
+    - name: "stage_4"
+      downsample_channels: 512
+      num_residual_blocks: 8
+      channels: [256, 512]
+      stride: 2
+      output_size: [4, 128]
+
+    - name: "stage_5"
+      downsample_channels: 1024
+      num_residual_blocks: 4
+      channels: [512, 1024]
+      stride: 2
+      output_size: [2, 64]
+
+  # Residual block configuration
+  residual_block:
+    type: "darknet"             # 1x1 reduce -> 3x3 expand -> add
+    batch_norm: true
+    activation: "leaky_relu"
+    leaky_slope: 0.1
+    bias: false
+
+  # Downsampling method
+  downsample:
+    method: "strided_conv"      # No max pooling
+    kernel_size: 3
+    padding: 1
+
+  # Layer count verification:
+  # stem: 1 conv
+  # stage_1: 1 downsample + 1 block x 2 conv = 3
+  # stage_2: 1 downsample + 2 blocks x 2 conv = 5
+  # stage_3: 1 downsample + 8 blocks x 2 conv = 17
+  # stage_4: 1 downsample + 8 blocks x 2 conv = 17
+  # stage_5: 1 downsample + 4 blocks x 2 conv = 9
+  # classification: 1 conv
+  # Total: 1 + 3 + 5 + 17 + 17 + 9 + 1 = 53
+
+# -----------------------------------------------------------------------------
+# U-Net Decoder
+# -----------------------------------------------------------------------------
+decoder:
+  name: "UNet-Decoder"
+
+  # Decoder stages (mirror of encoder, with skip connections)
+  stages:
+    - name: "decode_5"
+      in_channels: 1024         # From encoder stage 5
+      skip_channels: 512        # From encoder stage 4
+      out_channels: 512
+      upsample_factor: 2
+      output_size: [4, 128]
+
+    - name: "decode_4"
+      in_channels: 512
+      skip_channels: 256        # From encoder stage 3
+      out_channels: 256
+      upsample_factor: 2
+      output_size: [8, 256]
+
+    - name: "decode_3"
+      in_channels: 256
+      skip_channels: 128        # From encoder stage 2
+      out_channels: 128
+      upsample_factor: 2
+      output_size: [16, 512]
+
+    - name: "decode_2"
+      in_channels: 128
+      skip_channels: 64         # From encoder stage 1
+      out_channels: 64
+      upsample_factor: 2
+      output_size: [32, 1024]
+
+    - name: "decode_1"
+      in_channels: 64
+      skip_channels: 32         # From stem
+      out_channels: 32
+      upsample_factor: 2
+      output_size: [64, 2048]   # Full resolution
+
+  # Decoder block configuration
+  block:
+    upsample_method: "bilinear" # Bilinear interpolation (no transposed conv)
+    skip_connection: "concatenate"  # concat then 1x1 conv to reduce
+    conv_after_upsample: true
+    conv_kernel_size: 3
+    conv_padding: 1
+    batch_norm: true
+    activation: "leaky_relu"
+    leaky_slope: 0.1
+    bias: false
+
+  # Channel reduction after skip concatenation
+  skip_reduction:
+    method: "conv_1x1"          # 1x1 conv to reduce concatenated channels
+    batch_norm: true
+    activation: "leaky_relu"
+
+# -----------------------------------------------------------------------------
+# Classification Head
+# -----------------------------------------------------------------------------
+classification_head:
+  type: "conv_1x1"
+  in_channels: 32               # From last decoder stage
+  out_channels: 20              # num_classes
+  dropout: 0.01                 # Dropout before classification
+  bias: true                    # Bias in final conv
+  activation: null              # No activation (raw logits)
+
+# -----------------------------------------------------------------------------
+# Weight Initialization
+# -----------------------------------------------------------------------------
+initialization:
+  encoder:
+    method: "kaiming_normal"    # He initialization
+    mode: "fan_out"
+    nonlinearity: "leaky_relu"
+  decoder:
+    method: "kaiming_normal"
+    mode: "fan_out"
+    nonlinearity: "leaky_relu"
+  classification:
+    method: "xavier_normal"     # Xavier for final layer
+  batch_norm:
+    weight: 1.0
+    bias: 0.0
+
+# -----------------------------------------------------------------------------
+# Pre-trained Weights
+# -----------------------------------------------------------------------------
+pretrained:
+  enabled: false                # Set true to load ImageNet weights
+  source: "darknet53_imagenet"
+  path: "./pretrained/darknet53.pth"
+  # Note: First conv layer (5ch input) cannot use pretrained (3ch) directly
+  # Strategy: Initialize first conv randomly, load rest from pretrained
+  adapt_first_conv: true
+  adaptation_method: "random"   # or "replicate" (copy RGB weights to extra channels)
+
+# -----------------------------------------------------------------------------
+# Model Complexity Summary
+# -----------------------------------------------------------------------------
+complexity:
+  total_parameters: 50_400_000  # ~50.4M
+  encoder_parameters: 40_100_000
+  decoder_parameters: 10_200_000
+  head_parameters: 100_000
+
+  # FLOPs (at 64x2048 input)
+  total_gflops: 82.5
+  encoder_gflops: 65.0
+  decoder_gflops: 17.0
+  head_gflops: 0.5
+
+  # Memory (inference, batch=1)
+  feature_map_memory_mb: 850
+  parameter_memory_mb: 192
+  total_inference_memory_mb: 1042
+
+# -----------------------------------------------------------------------------
+# DarkNet-21 Variant (for comparison/faster inference)
+# -----------------------------------------------------------------------------
+darknet21_variant:
+  enabled: false                # Set true to use DarkNet-21 instead
+  stages:
+    - name: "stage_1"
+      num_residual_blocks: 1
+      channels: [32, 64]
+    - name: "stage_2"
+      num_residual_blocks: 1
+      channels: [64, 128]
+    - name: "stage_3"
+      num_residual_blocks: 2
+      channels: [128, 256]
+    - name: "stage_4"
+      num_residual_blocks: 4
+      channels: [256, 512]
+    - name: "stage_5"
+      num_residual_blocks: 4
+      channels: [512, 1024]
+  # Total: 1 + 3 + 3 + 5 + 9 + 9 + 1 = 21 (approximate counting)
+  total_parameters: 25_000_000  # ~25M
+  inference_time_ms: 14
+  miou_semantickitti: 47.4      # Without KNN post-processing

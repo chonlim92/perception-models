@@ -1,0 +1,333 @@
+# CenterPoint Pillar-Based Configuration (PointPillars-style Encoding)
+# Target: nuScenes dataset
+# Reference: "Center-based 3D Object Detection and Tracking" (Yin et al., CVPR 2021)
+#
+# Key Differences from Voxel Variant:
+#   - Uses pillar encoding (full Z-height columns) instead of fine-grained 3D voxels
+#   - No 3D sparse convolution (replaced by 2D convolutions on pillar features)
+#   - Faster inference (~25 FPS vs ~16 FPS on A100)
+#   - Slightly lower accuracy (~2-3 NDS points below voxel variant)
+
+model:
+  type: CenterPoint
+  variant: pillar
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  dataset: nuScenes
+  version: v1.0-trainval
+  root_path: data/nuscenes/
+  info_path:
+    train: data/nuscenes/infos_train_10sweeps.pkl
+    val: data/nuscenes/infos_val_10sweeps.pkl
+    test: data/nuscenes/infos_test_10sweeps.pkl
+  nsweeps: 10
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+# ============================================================================
+# Pillar Encoding (replaces 3D Voxelization + 3D Backbone)
+# ============================================================================
+pillarization:
+  type: PillarFeatureNet
+  pillar_size: [0.2, 0.2, 8.0]  # Coarser XY, full Z-height
+  point_cloud_range: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+  max_points_per_pillar: 20
+  max_pillars:
+    train: 60000
+    val: 80000
+    test: 80000
+  # Derived grid dimensions: [540, 540, 1] (only XY grid, no Z subdivision)
+
+  # PointPillars feature encoding
+  feature_net:
+    in_channels: 10  # x, y, z, intensity, time_lag, xc, yc, zc, xp, yp
+    # xc, yc, zc: offset from pillar center
+    # xp, yp: offset from pillar x,y position
+    layers:
+      - out_channels: 64
+        kernel_size: 1
+        batch_norm: true
+        relu: true
+    # Max pooling across points within each pillar
+    pooling: max
+    output_channels: 64
+
+# ============================================================================
+# 2D Backbone (replaces 3D Backbone + BEV Collapse)
+# ============================================================================
+backbone_2d:
+  type: SECOND_FPN
+  in_channels: 64
+  # Multi-scale feature extraction
+  stages:
+    - layer_nums: [3, 5, 5]
+      layer_strides: [2, 2, 2]
+      out_channels: [64, 128, 256]
+      # Input: 540x540x64
+      # After stage1: 270x270x64
+      # After stage2: 135x135x128
+      # After stage3: 68x68x256
+  # Feature Pyramid Network (upsample and concatenate)
+  fpn:
+    in_channels: [64, 128, 256]
+    out_channels: [128, 128, 128]
+    upsample_strides: [1, 2, 4]
+    # All upsampled to 270x270, then concatenated: 384 channels
+  final_channels: 384  # 128 * 3 stages concatenated
+
+# ============================================================================
+# Detection Head
+# ============================================================================
+head:
+  type: CenterHead
+  in_channels: 384
+  shared_conv_channels: 64
+  init_bias: -2.19  # Focal loss initialization
+
+  # Same class groups as voxel variant
+  class_groups:
+    - name: car
+      classes: [car]
+      num_classes: 1
+    - name: truck
+      classes: [truck, construction_vehicle]
+      num_classes: 2
+    - name: bus
+      classes: [bus, trailer]
+      num_classes: 2
+    - name: barrier
+      classes: [barrier]
+      num_classes: 1
+    - name: two_wheel
+      classes: [motorcycle, bicycle]
+      num_classes: 2
+    - name: pedestrian
+      classes: [pedestrian, traffic_cone]
+      num_classes: 2
+
+  # Same regression heads as voxel variant
+  regression_heads:
+    offset:
+      channels: 2
+      description: "Sub-pixel center offset (dx, dy)"
+    height:
+      channels: 1
+      description: "Absolute height of object center (z)"
+    size:
+      channels: 3
+      description: "Log-normalized dimensions (log_w, log_l, log_h)"
+    rotation:
+      channels: 2
+      description: "Yaw angle as (sin_theta, cos_theta)"
+    velocity:
+      channels: 2
+      description: "BEV velocity (vx, vy) in m/s"
+
+  # Peak extraction at inference
+  post_processing:
+    max_detections_per_head: 500
+    nms_kernel_size: 3
+    score_threshold: 0.1
+    nms_iou_threshold: null
+
+# ============================================================================
+# Two-Stage Refinement
+# ============================================================================
+two_stage:
+  enabled: false  # Typically not used with pillar variant for speed
+  # Can be enabled for accuracy at the cost of latency
+  # feature_extraction:
+  #   type: BEVBilinear
+  #   num_sample_points: 5
+  #   feature_channels: 384
+  # mlp:
+  #   hidden_dims: [256, 256]
+  #   dropout: 0.0
+  #   batch_norm: true
+
+# ============================================================================
+# Loss Configuration (same as voxel variant)
+# ============================================================================
+loss:
+  heatmap:
+    type: GaussianFocalLoss
+    alpha: 2.0
+    beta: 4.0
+    weight: 1.0
+  offset:
+    type: L1Loss
+    weight: 2.0
+  height:
+    type: L1Loss
+    weight: 2.0
+  size:
+    type: L1Loss
+    weight: 0.2
+  rotation:
+    type: L1Loss
+    weight: 1.0
+  velocity:
+    type: L1Loss
+    weight: 0.2
+
+gaussian_overlap: 0.1
+min_radius: 2
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  epochs: 20
+  batch_size: 4  # per GPU
+  num_workers: 4
+  seed: 42
+
+  optimizer:
+    type: AdamW
+    lr: 0.001
+    betas: [0.9, 0.99]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+  scheduler:
+    type: OneCycleLR
+    max_lr: 0.001
+    pct_start: 0.4
+    anneal_strategy: cos
+    div_factor: 10
+    final_div_factor: 100
+
+  gradient_clip:
+    type: norm
+    max_norm: 35.0
+
+  fade:
+    enabled: true
+    fade_epochs: 5
+
+  distributed:
+    backend: nccl
+    sync_bn: true
+    num_gpus: 8
+
+# ============================================================================
+# Data Augmentation (same as voxel variant)
+# ============================================================================
+augmentation:
+  gt_sampling:
+    enabled: true
+    db_info_path: data/nuscenes/dbinfos_train_10sweeps.pkl
+    sample_groups:
+      car: 15
+      truck: 3
+      construction_vehicle: 7
+      bus: 4
+      trailer: 6
+      barrier: 10
+      motorcycle: 6
+      bicycle: 6
+      pedestrian: 10
+      traffic_cone: 10
+    min_points:
+      car: 5
+      truck: 5
+      construction_vehicle: 5
+      bus: 5
+      trailer: 5
+      barrier: 5
+      motorcycle: 5
+      bicycle: 5
+      pedestrian: 5
+      traffic_cone: 5
+
+  random_rotation:
+    enabled: true
+    range: [-0.7854, 0.7854]
+
+  random_scaling:
+    enabled: true
+    range: [0.95, 1.05]
+
+  random_translation:
+    enabled: true
+    std: [0.2, 0.2, 0.2]
+
+  random_flip:
+    enabled: true
+    x_axis: true
+    y_axis: true
+
+  point_shuffle:
+    enabled: true
+
+# ============================================================================
+# Tracking Configuration
+# ============================================================================
+tracking:
+  type: GreedyCenterDistance
+  max_age: 3
+  dist_threshold: 4.0
+  velocity_weight: 1.0
+  min_hits: 1
+
+# ============================================================================
+# Evaluation
+# ============================================================================
+evaluation:
+  dataset: nuScenes
+  metrics:
+    - NDS
+    - mAP
+    - mATE
+    - mASE
+    - mAOE
+    - mAVE
+    - mAAE
+  tracking_metrics:
+    - AMOTA
+    - AMOTP
+    - IDS
+    - FRAG
+  eval_frequency: 1
+  score_threshold: 0.1
+  dist_thresholds: [0.5, 1.0, 2.0, 4.0]
+
+# ============================================================================
+# Inference
+# ============================================================================
+inference:
+  batch_size: 1
+  score_threshold: 0.1
+  max_detections: 500
+  use_two_stage: false
+  output_format: nuscenes_submission
+
+# ============================================================================
+# Performance Comparison (Pillar vs Voxel)
+# ============================================================================
+# Expected performance on nuScenes val:
+#
+# | Metric    | Pillar  | Voxel   | Delta   |
+# |-----------|---------|---------|---------|
+# | NDS       | ~64.5   | ~66.8   | -2.3    |
+# | mAP       | ~55.8   | ~58.3   | -2.5    |
+# | mATE      | ~0.290  | ~0.262  | +0.028  |
+# | FPS (A100)| ~25     | ~16     | +56%    |
+# | Latency   | ~40ms   | ~62ms   | -35%    |
+# | GPU Mem   | ~12GB   | ~24GB   | -50%    |
+#
+# Trade-off: Pillar is significantly faster and uses less memory,
+# at the cost of ~2-3 points in NDS/mAP. Suitable for real-time
+# deployment where latency is critical.

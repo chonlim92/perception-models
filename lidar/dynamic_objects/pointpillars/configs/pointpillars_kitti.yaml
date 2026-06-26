@@ -1,0 +1,328 @@
+# PointPillars Configuration for KITTI Dataset
+# Reference: "PointPillars: Fast Encoders for Object Detection from Point Clouds" (Lang et al., CVPR 2019)
+
+model:
+  type: PointPillars
+  variant: kitti
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  dataset: KITTI
+  root_path: data/kitti/
+  info_path:
+    train: data/kitti/kitti_infos_train.pkl
+    val: data/kitti/kitti_infos_val.pkl
+    test: data/kitti/kitti_infos_test.pkl
+  classes:
+    - Car
+    - Pedestrian
+    - Cyclist
+
+# =============================================================================
+# Pillar Feature Net (PFN)
+# =============================================================================
+pillar_feature_net:
+  # Maximum number of non-empty pillars to process per frame
+  # Limits computational cost; excess pillars are randomly dropped
+  max_pillars: 12000
+
+  # Maximum number of LiDAR points per pillar
+  # Points exceeding this are randomly subsampled; fewer are zero-padded
+  max_points_per_pillar: 100
+
+  # Pillar spatial extent in x-y plane (meters)
+  # Smaller pillars = finer resolution but more compute
+  pillar_size: [0.16, 0.16]
+
+  # Per-point input features:
+  # x, y, z          - 3D coordinates of the point
+  # intensity        - LiDAR return intensity (reflectance)
+  # xc, yc, zc      - offset from arithmetic mean of all points in the pillar
+  # xp, yp          - offset from the pillar center (x, y only)
+  num_point_features: 9
+
+  # Output feature dimension after PointNet-style encoding
+  # A linear layer + BatchNorm + ReLU projects per-point features to this dim,
+  # then max-pooling across points produces a single feature vector per pillar
+  output_channels: 64
+
+# =============================================================================
+# Point Cloud Range
+# =============================================================================
+point_cloud_range:
+  # [x_min, y_min, z_min, x_max, y_max, z_max]
+  # KITTI uses front-view only (positive x = forward in LiDAR frame)
+  # x: 0 to 69.12m (forward range)
+  # y: -39.68 to 39.68m (left-right, symmetric)
+  # z: -3 to 1m (height, captures ground to slightly above vehicles)
+  range: [0, -39.68, -3, 69.12, 39.68, 1]
+
+  # Derived grid dimensions:
+  # grid_x = (69.12 - 0) / 0.16 = 432
+  # grid_y = (39.68 - (-39.68)) / 0.16 = 496
+  # Pseudo-image shape: (64, 496, 432) = (C, H, W)
+
+# =============================================================================
+# 2D CNN Backbone
+# =============================================================================
+backbone_2d:
+  # Three downsampling blocks, each containing multiple Conv-BN-ReLU layers
+  # Progressive channel increase captures increasingly abstract features
+  num_blocks: 3
+
+  blocks:
+    - name: block1
+      # Stride-2 convolution for spatial downsampling
+      stride: 2
+      # Number of Conv-BN-ReLU layers in this block
+      num_layers: 3
+      # Output channel dimension
+      out_channels: 64
+    - name: block2
+      stride: 2
+      num_layers: 5
+      out_channels: 128
+    - name: block3
+      stride: 2
+      num_layers: 5
+      out_channels: 256
+
+  # All convolutions use 3x3 kernels with padding=1 (same padding before stride)
+  kernel_size: 3
+  padding: 1
+  # Batch normalization momentum
+  bn_momentum: 0.1
+  # Activation function
+  activation: ReLU
+
+# =============================================================================
+# Neck (Feature Pyramid / Multi-Scale Fusion)
+# =============================================================================
+neck:
+  type: SECONDFPN
+  # Upsample each backbone block output to the same spatial resolution,
+  # then concatenate along channel dimension for multi-scale features
+
+  upsample_strides: [1, 2, 4]
+  # Each block's features are upsampled with transposed convolution
+  upsample_channels: [128, 128, 128]
+
+  # Final concatenated output: 128 + 128 + 128 = 384 channels
+  output_channels: 384
+
+# =============================================================================
+# Detection Head (SSD-style Anchor-Based)
+# =============================================================================
+head:
+  type: AnchorHead
+  in_channels: 384
+
+  # Per-class anchor definitions
+  # Each class has anchors with specific 3D sizes and orientations
+  anchors:
+    - class: Car
+      # Anchor sizes: [length, width, height] in meters
+      # Based on mean dimensions in KITTI training set
+      size: [3.9, 1.6, 1.56]
+      # Anchor center height above ground
+      anchor_height: -1.78
+      # Two rotation angles: 0 (aligned with x-axis) and pi/2 (perpendicular)
+      rotations: [0, 1.5707963]
+      # Matched IoU thresholds for positive/negative assignment
+      matched_threshold: 0.6
+      unmatched_threshold: 0.45
+
+    - class: Pedestrian
+      size: [0.8, 0.6, 1.73]
+      anchor_height: -0.6
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.5
+      unmatched_threshold: 0.35
+
+    - class: Cyclist
+      size: [1.76, 0.6, 1.73]
+      anchor_height: -0.6
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.5
+      unmatched_threshold: 0.35
+
+  # Bounding box regression targets: (x, y, z, w, l, h, theta) = 7 parameters
+  num_box_params: 7
+
+  # Direction classification head
+  # Resolves heading ambiguity (0 vs pi) that regression alone cannot handle
+  direction_classification:
+    enabled: true
+    num_bins: 2
+    offset: 0.78539  # pi/4, direction bin boundary offset
+
+# =============================================================================
+# Loss Configuration
+# =============================================================================
+loss:
+  # Classification loss: Focal Loss to handle class imbalance
+  # Most anchors are background; focal loss down-weights easy negatives
+  classification:
+    type: FocalLoss
+    alpha: 0.25      # Balancing factor for positive/negative
+    gamma: 2.0       # Focusing parameter; higher = more focus on hard examples
+    weight: 1.0      # Overall loss weight
+
+  # Bounding box regression loss: Smooth L1 (Huber loss)
+  # Robust to outliers compared to pure L2
+  regression:
+    type: SmoothL1Loss
+    beta: 1.0        # Transition point between L1 and L2 behavior
+    weight: 2.0      # Overall loss weight
+    # Regression is only applied to positive (matched) anchors
+    code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # Per-param weights for x,y,z,w,l,h,theta
+
+  # Direction classification loss: Cross Entropy
+  direction:
+    type: CrossEntropyLoss
+    weight: 0.2      # Lower weight as it's an auxiliary task
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  epochs: 80
+  batch_size: 6       # Per GPU; PointPillars is memory-efficient
+  num_workers: 4
+  seed: 42
+
+  # -----------------------------------------------------------------------------
+  # Optimizer
+  # -----------------------------------------------------------------------------
+  optimizer:
+    type: Adam
+    lr: 0.002          # 2e-3 initial learning rate
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+  # -----------------------------------------------------------------------------
+  # Learning Rate Schedule: One-Cycle Policy
+  # -----------------------------------------------------------------------------
+  scheduler:
+    type: OneCycleLR
+    max_lr: 0.002       # Peak learning rate
+    pct_start: 0.4      # Fraction of training spent increasing LR
+    anneal_strategy: cos # Cosine annealing in the decay phase
+    div_factor: 10       # Initial LR = max_lr / div_factor = 2e-4
+    final_div_factor: 100 # Final LR = initial_lr / final_div_factor = 2e-6
+
+  # -----------------------------------------------------------------------------
+  # Gradient Clipping
+  # -----------------------------------------------------------------------------
+  gradient_clip:
+    type: norm
+    max_norm: 10.0      # Clip gradients with norm > 10
+
+  # Distributed training settings
+  distributed:
+    backend: nccl
+    sync_bn: false       # PointPillars uses standard BN (fast enough per-GPU)
+    num_gpus: 4
+
+# =============================================================================
+# Data Augmentation
+# =============================================================================
+augmentation:
+  # Ground-truth database sampling (copy-paste augmentation)
+  # Inserts annotated objects from a pre-built database into training scenes
+  gt_sampling:
+    enabled: true
+    db_info_path: data/kitti/kitti_dbinfos_train.pkl
+    sample_groups:
+      Car: 15
+      Pedestrian: 10
+      Cyclist: 10
+    min_points:
+      Car: 5
+      Pedestrian: 5
+      Cyclist: 5
+    # Remove sampled points that collide with existing objects
+    remove_overlap: true
+
+  # Global random rotation around z-axis
+  random_rotation:
+    enabled: true
+    range: [-0.7854, 0.7854]  # [-pi/4, pi/4] radians
+
+  # Global random scaling
+  random_scaling:
+    enabled: true
+    range: [0.95, 1.05]
+
+  # Global random translation
+  random_translation:
+    enabled: true
+    std: [0.2, 0.2, 0.2]  # Standard deviation in meters per axis
+
+  # Random horizontal flip (along y-axis in LiDAR frame)
+  random_flip:
+    enabled: true
+    x_axis: true     # Flip across x-axis (left-right)
+    y_axis: false    # KITTI is front-view only; no front-back flip
+
+  # Point-level augmentation
+  point_shuffle:
+    enabled: true    # Randomly shuffle point order within each pillar
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  dataset: KITTI
+
+  # KITTI 3D object detection metrics
+  metrics:
+    - AP_3D       # 3D Average Precision (primary metric)
+    - AP_BEV      # Bird's Eye View Average Precision
+    - AP_2D       # 2D image-plane Average Precision (optional)
+
+  # Per-class IoU thresholds for AP computation
+  # Car uses stricter threshold; smaller objects use more lenient
+  iou_thresholds:
+    Car: 0.7
+    Pedestrian: 0.5
+    Cyclist: 0.5
+
+  # KITTI difficulty levels based on:
+  # - 2D bounding box height (pixels)
+  # - Occlusion level (0=fully visible, 1=partly, 2=largely, 3=unknown)
+  # - Truncation (fraction of object outside image boundary)
+  difficulty_levels:
+    easy:
+      min_bbox_height: 40
+      max_occlusion: 0
+      max_truncation: 0.15
+    moderate:
+      min_bbox_height: 25
+      max_occlusion: 1
+      max_truncation: 0.30
+    hard:
+      min_bbox_height: 25
+      max_occlusion: 2
+      max_truncation: 0.50
+
+  # 11-point interpolation (KITTI legacy) or 40-point (KITTI updated)
+  recall_points: 40
+  eval_frequency: 5  # Evaluate every N epochs
+
+# =============================================================================
+# Inference
+# =============================================================================
+inference:
+  batch_size: 1
+  score_threshold: 0.1
+  # Non-maximum suppression
+  nms:
+    type: rotated_nms
+    iou_threshold: 0.01  # Very aggressive NMS for KITTI
+    pre_max_size: 4096
+    post_max_size: 500
+  output_format: kitti_submission

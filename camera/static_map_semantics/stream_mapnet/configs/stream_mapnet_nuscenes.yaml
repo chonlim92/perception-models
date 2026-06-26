@@ -1,0 +1,266 @@
+# =============================================================================
+# StreamMapNet - nuScenes Dataset Configuration
+# =============================================================================
+# Inherits from stream_mapnet_base.yaml and overrides dataset-specific settings
+# for the nuScenes dataset (v1.0). Includes camera definitions, dataset paths,
+# coordinate system conventions, and evaluation protocol.
+# =============================================================================
+
+# Base configuration to inherit from
+_base_: "./stream_mapnet_base.yaml"
+
+# -----------------------------------------------------------------------------
+# Dataset Paths
+# -----------------------------------------------------------------------------
+data:
+  dataset_type: "NuScenesMapDataset"
+  dataset_version: "v1.0-trainval"
+
+  # Root data directory (expects standard nuScenes directory structure)
+  data_root: "data/nuscenes/"
+
+  # Annotation files (pre-generated map element annotations)
+  ann_file:
+    train: "data/nuscenes/annotations/stream_mapnet_train.pkl"
+    val: "data/nuscenes/annotations/stream_mapnet_val.pkl"
+
+  # nuScenes map expansion data (vector map ground truth)
+  map_root: "data/nuscenes/maps/"
+
+  # Pre-computed info files with calibration and ego poses
+  info_file:
+    train: "data/nuscenes/nuscenes_infos_temporal_train.pkl"
+    val: "data/nuscenes/nuscenes_infos_temporal_val.pkl"
+
+  # -----------------------------------------------------------------------------
+  # nuScenes Camera Configuration
+  # -----------------------------------------------------------------------------
+  # 6 surround-view cameras covering 360-degree field of view
+  cameras:
+    names:
+      - "CAM_FRONT"
+      - "CAM_FRONT_RIGHT"
+      - "CAM_FRONT_LEFT"
+      - "CAM_BACK"
+      - "CAM_BACK_LEFT"
+      - "CAM_BACK_RIGHT"
+    num_cameras: 6
+    # Original image resolution before preprocessing
+    original_size: [900, 1600]  # (H, W)
+    # Target size after resize (must match base config img_size)
+    input_size: [256, 704]      # (H, W)
+
+  # -----------------------------------------------------------------------------
+  # nuScenes Coordinate System
+  # -----------------------------------------------------------------------------
+  # nuScenes uses a right-handed coordinate system:
+  #   x: forward (longitudinal)
+  #   y: left (lateral)
+  #   z: up (vertical)
+  # All map annotations are in ego-vehicle frame at each keyframe timestamp.
+  coordinate_system:
+    type: "ego_vehicle"
+    x_axis: "forward"
+    y_axis: "left"
+    z_axis: "up"
+    # LiDAR to ego transform is identity in nuScenes (LiDAR frame = ego frame)
+    lidar_to_ego: true
+
+  # -----------------------------------------------------------------------------
+  # BEV Perception Range (nuScenes standard)
+  # -----------------------------------------------------------------------------
+  # Defines the spatial extent of the BEV grid around the ego vehicle
+  bev_range:
+    x: [-30.0, 30.0]           # 60m longitudinal range (front/back)
+    y: [-15.0, 15.0]           # 30m lateral range (left/right)
+
+  # BEV grid parameters (derived from range and base resolution)
+  # Grid size: x_range/resolution = 60/0.3 = 200 cells
+  #            y_range/resolution = 30/0.3 = 100 cells
+  bev_grid:
+    x_size: 200
+    y_size: 100
+    resolution: 0.3            # meters per BEV pixel
+
+  # -----------------------------------------------------------------------------
+  # Map Classes (nuScenes HD map layers)
+  # -----------------------------------------------------------------------------
+  map_classes:
+    - "lane_divider"           # lane boundary markings
+    - "road_boundary"          # road edge / curb lines
+    - "ped_crossing"           # pedestrian crossing areas
+  num_classes: 3
+
+  # Mapping from nuScenes map layer names to our class indices
+  nuscenes_map_layer_mapping:
+    lane_divider:
+      layers: ["lane_divider"]
+      class_id: 0
+    road_boundary:
+      layers: ["road_segment", "road_divider"]
+      class_id: 1
+    ped_crossing:
+      layers: ["ped_crossing"]
+      class_id: 2
+
+  # -----------------------------------------------------------------------------
+  # Temporal Sequence (nuScenes keyframes at 2Hz)
+  # -----------------------------------------------------------------------------
+  temporal:
+    window_size: 8             # 8 keyframes = 4 seconds of history
+    frame_interval: 1          # use every keyframe (2Hz)
+    keyframe_rate: 2.0         # nuScenes keyframe frequency (Hz)
+    drop_history_prob: 0.2     # randomly drop history during training
+    # Handle scene boundaries - reset temporal buffer at scene start
+    reset_on_scene_change: true
+
+  # -----------------------------------------------------------------------------
+  # nuScenes Data Splits
+  # -----------------------------------------------------------------------------
+  splits:
+    train:
+      scenes: 700              # 700 training scenes
+      samples: ~28000          # approximate training samples
+    val:
+      scenes: 150              # 150 validation scenes
+      samples: ~6000           # approximate validation samples
+
+  # -----------------------------------------------------------------------------
+  # Data Loading
+  # -----------------------------------------------------------------------------
+  # nuScenes-specific loading pipeline
+  loading:
+    load_interval: 1           # load every Nth sample (1 = all)
+    # Image loading
+    img_backend: "pillow"      # 'pillow' or 'turbojpeg'
+    # Calibration loading
+    load_cam_intrinsics: true
+    load_cam_extrinsics: true
+    load_ego_pose: true
+    # Map vector loading
+    load_map_vectors: true
+    map_vector_thickness: 0    # 0 = polyline, >0 = thickened polygon
+
+# -----------------------------------------------------------------------------
+# nuScenes-Specific Augmentation Overrides
+# -----------------------------------------------------------------------------
+# Augmentations tuned for nuScenes camera characteristics
+data_augmentation:
+  image:
+    random_resize:
+      scale_range: [0.9, 1.1]
+    random_crop:
+      crop_size: [256, 704]
+    random_flip:
+      horizontal_prob: 0.5
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+    # GridMask occlusion augmentation (effective for dense scenes)
+    grid_mask:
+      enabled: true
+      ratio: 0.5
+      prob: 0.7
+      max_epoch: 20            # disable grid mask in last few epochs
+  bev:
+    random_rotate:
+      angle_range: [-5.4, 5.4]
+    random_scale:
+      scale_range: [0.95, 1.05]
+    random_flip:
+      horizontal_prob: 0.5
+
+# -----------------------------------------------------------------------------
+# Training Overrides for nuScenes
+# -----------------------------------------------------------------------------
+training:
+  # Batch size tuned for 8x A100 GPUs with nuScenes
+  batch_size: 4                # per GPU (total effective batch = 32 on 8 GPUs)
+  num_workers: 4
+
+  # nuScenes has ~28k samples; with batch_size=32 effective, ~875 iters/epoch
+  epochs: 24
+
+  # Learning rate scaled for effective batch size
+  optimizer:
+    type: "AdamW"
+    lr: 2.0e-4                 # base lr for batch_size=32
+    weight_decay: 0.01
+
+  # Resume from checkpoint (set path when fine-tuning)
+  resume_from: null
+  load_from: null              # path to pretrained weights (e.g., FCOS3D backbone)
+
+# -----------------------------------------------------------------------------
+# Evaluation Settings (nuScenes Map Construction Protocol)
+# -----------------------------------------------------------------------------
+evaluation:
+  # nuScenes map evaluation protocol
+  protocol: "nuscenes_map"
+
+  # Chamfer distance thresholds for Average Precision (meters)
+  # Standard thresholds used in StreamMapNet / MapTR papers
+  cd_thresholds: [0.5, 1.0, 1.5]
+
+  # Per-class evaluation
+  eval_classes:
+    - "lane_divider"
+    - "road_boundary"
+    - "ped_crossing"
+
+  # Primary metric for model selection
+  primary_metric: "mAP"       # mean AP across all classes and thresholds
+
+  # Secondary metrics to track
+  secondary_metrics:
+    - "AP_lane_divider"
+    - "AP_road_boundary"
+    - "AP_ped_crossing"
+    - "chamfer_distance"       # mean Chamfer distance (lower is better)
+
+  # Evaluation frequency
+  eval_interval: 1             # evaluate every epoch
+  eval_on_train: false         # skip eval on training set
+
+  # Vectorized output post-processing for evaluation
+  postprocessing:
+    score_threshold: 0.3       # minimum confidence to keep predictions
+    nms:
+      enabled: false           # NMS not typically used for set-prediction models
+    # Polyline simplification before metric computation
+    simplify:
+      enabled: true
+      tolerance: 0.1           # meters (Douglas-Peucker)
+    # Maximum number of predictions per class
+    max_predictions_per_class: 50
+
+  # Visualization during evaluation
+  visualization:
+    enabled: false
+    save_dir: "work_dirs/stream_mapnet_nuscenes/vis"
+    max_samples: 50
+    # Plot settings
+    plot_gt: true              # overlay ground truth
+    plot_pred: true            # overlay predictions
+    bev_render: true           # render BEV map view
+    camera_render: true        # render predictions on camera images
+    line_width: 2
+    colors:
+      lane_divider: [0, 255, 0]       # green
+      road_boundary: [255, 0, 0]      # red
+      ped_crossing: [0, 0, 255]       # blue
+
+# -----------------------------------------------------------------------------
+# Output and Logging
+# -----------------------------------------------------------------------------
+output:
+  work_dir: "work_dirs/stream_mapnet_nuscenes"
+  # TensorBoard / WandB logging
+  logger:
+    type: "tensorboard"        # 'tensorboard' or 'wandb'
+    project: "stream_mapnet"
+    name: "nuscenes_base"
+  # Checkpoint naming
+  checkpoint_prefix: "stream_mapnet_nuscenes"

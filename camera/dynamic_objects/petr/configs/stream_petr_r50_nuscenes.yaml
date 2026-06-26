@@ -1,0 +1,407 @@
+# =============================================================================
+# StreamPETR Configuration - ResNet-50 with Object-Centric Temporal Modeling
+# =============================================================================
+# Training configuration for StreamPETR, a streaming perception model that
+# performs object-centric temporal modeling through query propagation.
+#
+# Key Innovation: Instead of dense BEV-level temporal fusion (like BEVFormer)
+# or frame-level feature alignment (like PETRv2), StreamPETR propagates object
+# queries across frames. This is fundamentally more efficient because:
+# 1. Only ~256 query vectors are propagated (vs 200x200=40K BEV features)
+# 2. Motion-aware layer norm compensates for ego-motion at the query level
+# 3. Memory usage is nearly constant regardless of temporal history length
+# 4. Natural object tracking emerges from query identity across frames
+#
+# Result: StreamPETR achieves state-of-the-art performance with real-time
+# inference speed (~30 FPS) and significantly lower memory consumption.
+#
+# Reference: Exploring Object-Centric Temporal Modeling for Efficient
+#            Multi-View 3D Object Detection (ICCV 2023)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  type: stream_petr
+
+  # --- Image Backbone ---
+  backbone:
+    type: resnet50
+    pretrained: true
+    pretrained_weights: imagenet
+    # Multi-scale feature extraction from stages C3, C4, C5
+    out_indices: [1, 2, 3]
+    # Freeze first stage
+    frozen_stages: 1
+    # Freeze BN for stable training
+    norm_eval: true
+    norm_cfg:
+      type: BN
+      requires_grad: false
+
+  # --- Feature Pyramid Network (Neck) ---
+  neck:
+    type: fpn
+    in_channels: [512, 1024, 2048]
+    out_channels: 256
+    num_outs: 3
+    start_level: 0
+    add_extra_convs: on_input
+    relu_before_extra_convs: true
+
+  # --- 3D Position Embedding Generator ---
+  position_embedding:
+    # Frustum depth discretization
+    depth_start: 1.0
+    depth_end: 61.2
+    depth_step: 0.956
+    depth_num: 64
+
+    # 3D PE MLP
+    position_mlp:
+      input_dim: 3
+      hidden_dim: 1024
+      output_dim: 256
+      num_layers: 2
+      activation: relu
+
+    # Coordinate normalization
+    normalize_coords: true
+    pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+    # Use LID for depth discretization
+    use_lid: true
+
+  # --- Query Propagation Module (StreamPETR Core) ---
+  # Object-centric temporal modeling via query propagation
+  query_propagation:
+    # Enable query propagation across frames
+    propagate_queries: true
+
+    # Number of queries propagated from previous frame
+    # These carry temporal context about previously detected objects
+    # Remaining queries (900 - 256 = 644) are fresh random queries
+    num_propagated_queries: 256
+
+    # Total number of object queries per frame
+    # = num_propagated_queries + num_fresh_queries
+    num_queries: 900
+
+    # Memory length: maximum number of historical queries stored
+    # Longer memory enables tracking objects that were temporarily occluded
+    memory_len: 512
+
+    # Score threshold for propagating queries
+    # Only queries with confidence > threshold are propagated
+    # Prevents propagation of low-quality/background queries
+    propagation_threshold: 0.0
+
+    # How to select queries for propagation when more candidates exist
+    # than num_propagated_queries slots
+    # Options: 'topk' (by confidence), 'random', 'nms' (after NMS)
+    selection_strategy: topk
+
+    # Whether to detach propagated queries from computation graph
+    # Prevents gradient flow through time for memory efficiency
+    detach_propagated: true
+
+    # Query position update: apply ego-motion compensation to propagated
+    # query reference points so they remain in the current ego frame
+    ego_motion_compensation: true
+
+    # Velocity-based position prediction for propagated queries
+    # Uses predicted velocity to extrapolate object positions to current frame
+    velocity_prediction: true
+
+  # --- Motion-Aware Layer Norm (StreamPETR Innovation) ---
+  # Injects ego-motion information into layer normalization
+  # This allows the transformer to be aware of the ego vehicle's movement
+  # without explicit coordinate transformation of all features
+  motion_aware_layer_norm:
+    enabled: true
+    # Ego-motion encoding dimension (must match embed_dims)
+    motion_embed_dim: 256
+    # Number of MLP layers to encode the 4x4 ego-motion matrix
+    motion_mlp_layers: 2
+    # How motion embedding modulates LayerNorm:
+    # 'affine': motion -> scale & shift parameters for LayerNorm
+    # 'additive': motion embedding added after LayerNorm
+    modulation_type: affine
+
+  # --- Transformer Decoder ---
+  decoder:
+    # Number of decoder layers
+    num_decoder_layers: 6
+
+    # Total queries = propagated + fresh
+    num_queries: 900
+
+    # Feature dimension
+    embed_dims: 256
+
+    # Multi-head attention
+    num_heads: 8
+
+    # FFN dimension
+    ffn_dim: 2048
+
+    # Dropout
+    dropout: 0.1
+
+    # Standard cross-attention (queries attend to position-aware features)
+    attention_type: standard
+
+    # Pre-normalization with motion-aware LayerNorm
+    pre_norm: true
+
+    # Return intermediate outputs for auxiliary losses
+    return_intermediate: true
+
+    # Separate attention for propagated vs fresh queries
+    # Propagated queries may benefit from different attention patterns
+    separate_query_attention: false
+
+  # --- Detection Head ---
+  head:
+    # nuScenes 10 detection classes
+    num_classes: 10
+
+    # Box code: (cx, cy, cz, w, l, h, sin, cos, vx, vy)
+    code_size: 10
+
+    # Prediction head layers
+    num_reg_fcs: 2
+
+    # Sigmoid classification
+    use_sigmoid: true
+
+    # Separate cls/reg heads
+    shared_head: false
+
+    # Code weights for regression targets
+    code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Dataset
+  dataset: nuscenes
+
+  # Data paths
+  data_root: ./data/nuscenes/
+
+  # Annotation files (must include temporal sequence info)
+  train_ann: nuscenes_infos_temporal_train.pkl
+  val_ann: nuscenes_infos_temporal_val.pkl
+
+  # Input image size
+  img_size: [900, 1600]
+
+  # Number of cameras
+  num_cams: 6
+
+  # Detection classes
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+  # 3D perception range
+  pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+  # Temporal sequence configuration for StreamPETR
+  temporal:
+    # StreamPETR processes frames sequentially (streaming fashion)
+    # During training, we load consecutive frames from a sequence
+    num_prev_frames: 1
+    sequential: true
+    key_frame_interval: 0.5
+
+    # Training sequence length for backprop-through-time style training
+    # Longer sequences give better temporal learning but use more memory
+    train_sequence_length: 4
+
+    # Whether to randomly drop temporal connection during training
+    # Simulates sequence starts and improves robustness
+    random_drop_temporal: 0.1
+
+  # Data augmentation
+  augmentation:
+    resize: [0.38, 0.55]
+    rotation: [-5.4, 5.4]
+    flip: 0.5
+    grid_mask:
+      enabled: true
+      probability: 0.7
+      x_range: [64, 128]
+      y_range: [64, 128]
+      ratio: 0.5
+    color_jitter:
+      enabled: true
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+
+  # Data loading
+  workers_per_gpu: 4
+  shuffle: true
+  pin_memory: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Total training epochs
+  # StreamPETR converges well in 24 epochs like PETR/PETRv2
+  epochs: 24
+
+  # Batch size per GPU
+  # StreamPETR is more memory-efficient than BEV methods,
+  # but still limited to 1 per GPU with R50 backbone
+  batch_size: 1
+
+  # Number of GPUs
+  num_gpus: 8
+
+  # Effective batch size = 8
+
+  # Optimizer
+  optimizer: AdamW
+  lr: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+  # Gradient clipping
+  grad_clip: 35.0
+
+  # Learning rate schedule
+  lr_schedule:
+    type: cosine
+    warmup: linear
+    warmup_iters: 500
+    warmup_ratio: 0.33
+    min_lr_ratio: 1.0e-3
+
+  # Backbone LR multiplier
+  backbone_lr_mult: 0.1
+
+  # Mixed precision
+  mixed_precision: true
+  fp16_loss_scale: dynamic
+
+  # EMA
+  ema: false
+
+  # Checkpointing
+  checkpoint_interval: 1
+  eval_interval: 1
+
+  # Resume
+  resume_from: null
+
+  # Seed
+  seed: 0
+
+  # Distributed training
+  dist_backend: nccl
+
+  # CBGS (Class-Balanced Grouping and Sampling)
+  cbgs: false
+
+  # Gradient accumulation
+  accumulate_grad_batches: 1
+
+  # StreamPETR-specific training settings
+  streaming:
+    # During training, simulate streaming by processing frames sequentially
+    # and propagating queries within each training sample
+    train_streaming: true
+
+    # Number of frames per training clip
+    # Queries are propagated within each clip during training
+    frames_per_clip: 4
+
+    # Whether to reset queries at the start of each clip
+    reset_queries_per_clip: true
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Classification loss
+  cls_loss:
+    type: focal_loss
+    alpha: 0.25
+    gamma: 2.0
+    weight: 2.0
+
+  # Bounding box regression loss
+  bbox_loss:
+    type: l1_loss
+    weight: 0.25
+
+  # IoU loss (not used)
+  iou_loss:
+    type: none
+    weight: 0.0
+
+  # Hungarian matcher
+  matcher:
+    type: hungarian
+    cls_cost: 2.0
+    bbox_cost: 0.25
+    iou_cost: 0.0
+
+  # Auxiliary losses from intermediate decoder layers
+  auxiliary_loss: true
+
+  # Query propagation loss: encourages propagated queries to maintain
+  # consistent predictions across frames for the same object
+  propagation_loss:
+    enabled: true
+    # L1 loss on position difference between propagated query prediction
+    # and its prediction in the previous frame (after ego-motion compensation)
+    type: l1_loss
+    weight: 0.1
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  # nuScenes metrics
+  metrics:
+    - mAP
+    - NDS
+    - mATE
+    - mASE
+    - mAOE
+    - mAVE
+    - mAAE
+
+  # Post-processing
+  nms:
+    enabled: true
+    score_threshold: 0.1
+    max_per_frame: 300
+
+  # Streaming evaluation settings
+  streaming_eval:
+    # Process frames sequentially (simulates real-time deployment)
+    sequential: true
+    # Reset queries at the start of each scene
+    reset_per_scene: true
+
+  # Expected performance (StreamPETR-R50 on nuScenes val):
+  # mAP: ~38.4, NDS: ~44.9
+  # Significant improvement over PETR/PETRv2 due to effective temporal modeling
+  # Inference speed: ~30 FPS on single A100 GPU (3x faster than BEVFormer)

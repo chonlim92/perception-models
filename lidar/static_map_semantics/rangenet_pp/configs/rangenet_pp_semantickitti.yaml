@@ -1,0 +1,336 @@
+# =============================================================================
+# RangeNet++ Configuration for SemanticKITTI
+# Paper: "RangeNet++: Fast and Accurate LiDAR Semantic Segmentation"
+# Authors: Milioto et al., IROS 2019
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Dataset Configuration
+# -----------------------------------------------------------------------------
+dataset:
+  name: "SemanticKITTI"
+  root: "/data/semantickitti/dataset/sequences"
+
+  # Sequence splits
+  train_sequences: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
+  val_sequences: [8]
+  test_sequences: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+
+  # Data format
+  point_cloud_format: "bin"     # N x 4 float32 (x, y, z, intensity)
+  label_format: "label"         # N x uint32 (lower 16 bits = semantic)
+
+# -----------------------------------------------------------------------------
+# Sensor Configuration (Velodyne HDL-64E)
+# -----------------------------------------------------------------------------
+sensor:
+  name: "Velodyne HDL-64E"
+  num_beams: 64
+  rotation_frequency: 10        # Hz
+  points_per_revolution: 130000 # Approximate
+
+  # Field of View
+  fov:
+    vertical:
+      up: 2.0                   # degrees
+      down: -24.8               # degrees
+      total: 26.8               # degrees
+    horizontal:
+      min: 0.0                  # degrees
+      max: 360.0                # degrees
+
+  # Range
+  max_range: 120.0              # meters
+  min_range: 0.5                # meters (filter close points)
+
+  # Mounting
+  height_above_ground: 1.73     # meters
+
+  # Intensity
+  intensity_range: [0.0, 1.0]   # Normalized remission
+
+# -----------------------------------------------------------------------------
+# Range Image Configuration
+# -----------------------------------------------------------------------------
+range_image:
+  height: 64                    # Number of beams
+  width: 2048                   # Azimuth resolution (or 1024 for faster)
+
+  # Input channels
+  channels: 5                   # [range, x, y, z, intensity]
+  channel_names: ["range", "x", "y", "z", "intensity"]
+
+  # Normalization (computed from training set)
+  normalization:
+    means: [12.12, 0.21, -0.05, -1.02, 0.21]
+    stds: [12.32, 14.54, 9.86, 0.82, 0.16]
+
+  # Projection parameters
+  projection:
+    fov_up: 2.0                 # degrees
+    fov_down: -24.8             # degrees
+
+  # Empty pixel handling
+  empty_value: 0.0              # Value for pixels with no projection
+  min_range_threshold: 0.5      # Ignore points closer than this
+
+# -----------------------------------------------------------------------------
+# Class Configuration (20 classes: 19 evaluated + 1 unlabeled)
+# -----------------------------------------------------------------------------
+classes:
+  num_classes: 20               # Including unlabeled
+  num_eval_classes: 19          # Excluding unlabeled
+  ignore_index: 0               # Unlabeled class index (ignored in loss/eval)
+
+  labels:
+    0:
+      name: "unlabeled"
+      color: [0, 0, 0]
+      weight: 0.0               # Ignored in loss
+      evaluate: false
+    1:
+      name: "car"
+      color: [0, 0, 255]
+      weight: 3.5
+      evaluate: true
+    2:
+      name: "bicycle"
+      color: [245, 150, 100]
+      weight: 15.0
+      evaluate: true
+    3:
+      name: "motorcycle"
+      color: [150, 60, 30]
+      weight: 20.0
+      evaluate: true
+    4:
+      name: "truck"
+      color: [0, 0, 200]
+      weight: 8.0
+      evaluate: true
+    5:
+      name: "other-vehicle"
+      color: [200, 40, 255]
+      weight: 12.0
+      evaluate: true
+    6:
+      name: "person"
+      color: [255, 30, 30]
+      weight: 25.0
+      evaluate: true
+    7:
+      name: "bicyclist"
+      color: [255, 0, 255]
+      weight: 30.0
+      evaluate: true
+    8:
+      name: "motorcyclist"
+      color: [255, 150, 255]
+      weight: 50.0
+      evaluate: true
+    9:
+      name: "road"
+      color: [255, 0, 255]
+      weight: 1.0
+      evaluate: true
+    10:
+      name: "parking"
+      color: [255, 150, 255]
+      weight: 4.0
+      evaluate: true
+    11:
+      name: "sidewalk"
+      color: [75, 0, 75]
+      weight: 2.0
+      evaluate: true
+    12:
+      name: "other-ground"
+      color: [75, 0, 175]
+      weight: 6.0
+      evaluate: true
+    13:
+      name: "building"
+      color: [0, 200, 255]
+      weight: 1.5
+      evaluate: true
+    14:
+      name: "fence"
+      color: [50, 120, 255]
+      weight: 4.0
+      evaluate: true
+    15:
+      name: "vegetation"
+      color: [0, 175, 0]
+      weight: 1.0
+      evaluate: true
+    16:
+      name: "trunk"
+      color: [0, 60, 135]
+      weight: 8.0
+      evaluate: true
+    17:
+      name: "terrain"
+      color: [80, 240, 150]
+      weight: 2.5
+      evaluate: true
+    18:
+      name: "pole"
+      color: [150, 240, 255]
+      weight: 12.0
+      evaluate: true
+    19:
+      name: "traffic-sign"
+      color: [0, 0, 255]
+      weight: 18.0
+      evaluate: true
+
+  # Label mapping: original SemanticKITTI labels -> evaluation labels
+  label_mapping:
+    0: 0        # unlabeled
+    1: 0        # outlier -> unlabeled
+    10: 1       # car
+    11: 2       # bicycle
+    13: 5       # bus -> other-vehicle
+    15: 3       # motorcycle
+    16: 5       # on-rails -> other-vehicle
+    18: 4       # truck
+    20: 5       # other-vehicle
+    30: 6       # person
+    31: 7       # bicyclist
+    32: 8       # motorcyclist
+    40: 9       # road
+    44: 10      # parking
+    48: 11      # sidewalk
+    49: 12      # other-ground
+    50: 13      # building
+    51: 14      # fence
+    52: 0       # other-structure -> unlabeled
+    60: 9       # lane-marking -> road
+    70: 15      # vegetation
+    71: 16      # trunk
+    72: 17      # terrain
+    80: 18      # pole
+    81: 19      # traffic-sign
+    99: 0       # other-object -> unlabeled
+    252: 1      # moving-car -> car
+    253: 7      # moving-bicyclist -> bicyclist
+    254: 6      # moving-person -> person
+    255: 8      # moving-motorcyclist -> motorcyclist
+    256: 5      # moving-on-rails -> other-vehicle
+    257: 5      # moving-bus -> other-vehicle
+    258: 4      # moving-truck -> truck
+    259: 5      # moving-other-vehicle -> other-vehicle
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Optimizer
+  optimizer:
+    type: "SGD"
+    learning_rate: 0.01
+    momentum: 0.9
+    weight_decay: 0.0001
+    nesterov: true
+
+  # Learning rate schedule
+  scheduler:
+    type: "cosine_annealing_warm_restarts"
+    T_0: 10                     # Initial period (epochs)
+    T_mult: 2                   # Period multiplier
+    eta_min: 0.00001            # Minimum learning rate
+
+  # Warmup
+  warmup:
+    enabled: true
+    epochs: 1
+    start_lr: 0.001
+
+  # Training parameters
+  epochs: 150
+  batch_size: 4
+  num_workers: 8
+  pin_memory: true
+
+  # Loss function
+  loss:
+    type: "weighted_cross_entropy"
+    ignore_index: 0             # Ignore unlabeled
+    use_class_weights: true     # Apply inverse-frequency weighting
+
+  # Gradient clipping
+  gradient_clip:
+    enabled: true
+    max_norm: 10.0
+
+  # Mixed precision
+  mixed_precision: true         # FP16 training with AMP
+
+  # Checkpointing
+  checkpoint:
+    save_dir: "./checkpoints"
+    save_every: 5               # Save every N epochs
+    keep_last: 5                # Keep last N checkpoints
+    save_best: true             # Save best mIoU checkpoint
+
+# -----------------------------------------------------------------------------
+# Data Augmentation
+# -----------------------------------------------------------------------------
+augmentation:
+  # Random yaw rotation (horizontal shift in range image)
+  random_rotation:
+    enabled: true
+    range: [0, 360]             # degrees
+
+  # Random horizontal flip
+  random_flip:
+    enabled: true
+    probability: 0.5
+
+  # Random point/pixel dropout
+  random_dropout:
+    enabled: true
+    probability: 0.5            # Probability of applying dropout
+    max_rate: 0.10              # Maximum dropout rate (10% of points)
+
+  # Intensity jitter
+  intensity_jitter:
+    enabled: true
+    probability: 0.5
+    std: 0.02                   # Gaussian noise std
+
+# -----------------------------------------------------------------------------
+# KNN Post-Processing
+# -----------------------------------------------------------------------------
+post_processing:
+  knn:
+    enabled: true
+    k: 5                        # Number of nearest neighbors
+    search_radius: 1.0          # meters
+    cutoff: 1.0                 # Distance weight cutoff
+    use_gpu: true               # GPU-accelerated KNN
+
+# -----------------------------------------------------------------------------
+# Inference Configuration
+# -----------------------------------------------------------------------------
+inference:
+  batch_size: 1
+  range_image_width: 2048       # Can use 1024 for faster inference
+
+  # Output
+  save_predictions: true
+  output_dir: "./predictions"
+  output_format: "label"        # SemanticKITTI .label format
+
+  # Visualization
+  visualize: false
+  viz_output_dir: "./visualizations"
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  metrics: ["miou", "per_class_iou", "overall_accuracy"]
+  ignore_class: 0               # Ignore unlabeled
+  num_classes: 20
+  eval_sequences: [8]           # Validation on sequence 08

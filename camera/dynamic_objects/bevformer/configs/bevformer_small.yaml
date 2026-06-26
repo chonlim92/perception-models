@@ -1,0 +1,232 @@
+# =============================================================================
+# BEVFormer Small Configuration
+# =============================================================================
+# Lightweight configuration for quick experiments, debugging, and development.
+# Reduces model capacity, BEV resolution, and training duration to enable
+# rapid iteration on a single or dual GPU setup.
+#
+# Key differences from base config:
+#   - ResNet-50 backbone (lighter than ResNet-101)
+#   - 50x50 BEV grid (vs 200x200) -> 16x less BEV queries
+#   - 3 encoder/decoder layers (vs 6) -> 2x fewer transformer layers
+#   - 128-dim embeddings (vs 256) -> 4x less attention compute
+#   - 300 object queries (vs 900)
+#   - Smaller input images (450x800 vs 900x1600)
+#   - 2 temporal frames (vs 4) -> less memory usage
+#   - 12 epochs (vs 24) for faster experimentation
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  # --- Image Backbone ---
+  backbone:
+    # ResNet-50: lighter backbone for faster training and inference
+    type: resnet50
+    pretrained: true
+    pretrained_weights: imagenet
+    # Return C3, C4, C5 feature maps
+    out_indices: [2, 3, 4]
+    frozen_stages: 1
+    norm_eval: true
+
+  # --- Feature Pyramid Network (Neck) ---
+  neck:
+    type: fpn
+    # ResNet-50 channel dimensions for C3, C4, C5
+    in_channels: [512, 1024, 2048]
+    # Reduced output channels to match smaller embed_dims
+    out_channels: 128
+    num_outs: 4
+    start_level: 1
+    add_extra_convs: on_output
+
+  # --- BEV Encoder (Spatial-Temporal Transformer) ---
+  bev_encoder:
+    # Reduced embedding dimension (half of base)
+    # Significantly reduces memory and compute in attention layers
+    embed_dims: 128
+
+    # Reduced BEV grid: 50x50 = 2,500 queries (vs 200x200 = 40,000)
+    # Each cell represents (102.4m / 50) = 2.048m resolution
+    # Sufficient for validating model behavior, not for final accuracy
+    bev_h: 50
+    bev_w: 50
+
+    # Fewer encoder layers for faster forward/backward pass
+    num_encoder_layers: 3
+
+    # Attention heads (reduced proportionally with embed_dims)
+    num_heads: 8
+
+    # Same sampling configuration as base (these are lightweight)
+    num_points_spatial: 4
+    num_points_temporal: 4
+    num_levels: 4
+    num_cams: 6
+
+    # Same perception range as base for consistent coordinate system
+    pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+    # 3D reference points per BEV query
+    num_ref_points: 4
+
+  # --- Transformer Decoder ---
+  decoder:
+    # Fewer decoder layers for faster iteration
+    num_decoder_layers: 3
+
+    # Fewer object queries (sufficient for most scenes)
+    num_queries: 300
+
+    # Must match bev_encoder embed_dims
+    embed_dims: 128
+
+    num_heads: 8
+
+    # FFN dimension scaled proportionally (4x embed_dims)
+    ffn_dim: 512
+
+    dropout: 0.1
+
+    # Keep iterative refinement for better convergence
+    iterative_bbox_refinement: true
+
+  # --- Detection Head ---
+  head:
+    num_classes: 10
+    # Same box parameterization as base
+    code_size: 10
+    num_reg_fcs: 2
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  dataset: nuscenes
+  data_root: ./data/nuscenes/
+  train_ann: nuscenes_infos_temporal_train.pkl
+  val_ann: nuscenes_infos_temporal_val.pkl
+
+  # Halved input resolution for faster data loading and feature extraction
+  # Reduces backbone compute by ~4x compared to full resolution
+  img_size: [450, 800]
+
+  # Fewer temporal frames to reduce memory (2 previous + 1 current = 3 total)
+  num_temporal_frames: 2
+
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+  augmentation:
+    # Same augmentation ratios (applied to smaller input)
+    resize: [0.38, 0.55]
+    rotation: [-5.4, 5.4]
+    flip: 0.5
+    grid_mask:
+      enabled: true
+      probability: 0.7
+      x_range: [32, 64]
+      y_range: [32, 64]
+      ratio: 0.5
+
+  workers_per_gpu: 4
+  shuffle: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Shorter training for rapid experimentation
+  epochs: 12
+
+  # Larger batch size possible due to smaller model and input
+  batch_size: 2
+
+  # Designed for single or dual GPU development setups
+  num_gpus: 2
+
+  # Effective batch size = 2 * 2 = 4
+
+  optimizer: AdamW
+  # Higher LR to compensate for fewer total training steps
+  # Also accounts for larger effective batch size relative to base
+  lr: 4.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+  grad_clip: 35.0
+
+  lr_schedule:
+    type: cosine
+    warmup: linear
+    warmup_iters: 500
+    warmup_ratio: 0.33
+    min_lr_ratio: 1.0e-3
+
+  backbone_lr_mult: 0.1
+
+  mixed_precision: true
+  fp16_loss_scale: dynamic
+
+  ema: false
+
+  checkpoint_interval: 1
+  eval_interval: 1
+
+  resume_from: null
+  seed: 0
+  dist_backend: nccl
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Same loss configuration as base (losses are architecture-independent)
+  cls_loss:
+    type: focal_loss
+    alpha: 0.25
+    gamma: 2.0
+    weight: 2.0
+
+  bbox_loss:
+    type: l1_loss
+    weight: 0.25
+
+  iou_loss:
+    type: none
+    weight: 0.0
+
+  matcher:
+    type: hungarian
+    cls_cost: 2.0
+    bbox_cost: 0.25
+    iou_cost: 0.0
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  metrics:
+    - mAP
+    - NDS
+    - mATE
+    - mASE
+    - mAOE
+    - mAVE
+    - mAAE
+
+  nms:
+    enabled: true
+    score_threshold: 0.1
+    max_per_frame: 300

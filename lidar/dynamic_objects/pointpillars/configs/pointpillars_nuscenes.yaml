@@ -1,0 +1,373 @@
+# PointPillars Configuration for nuScenes Dataset
+# Reference: "PointPillars: Fast Encoders for Object Detection from Point Clouds" (Lang et al., CVPR 2019)
+# Adapted for nuScenes 360-degree LiDAR with 10-class detection
+
+model:
+  type: PointPillars
+  variant: nuscenes
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  dataset: nuScenes
+  version: v1.0-trainval
+  root_path: data/nuscenes/
+  info_path:
+    train: data/nuscenes/infos_train_10sweeps_withvelo.pkl
+    val: data/nuscenes/infos_val_10sweeps_withvelo.pkl
+    test: data/nuscenes/infos_test_10sweeps_withvelo.pkl
+  # Number of LiDAR sweeps to aggregate (temporal context)
+  # More sweeps = denser point cloud but higher latency
+  nsweeps: 10
+  classes:
+    - car
+    - truck
+    - bus
+    - trailer
+    - construction_vehicle
+    - pedestrian
+    - motorcycle
+    - bicycle
+    - barrier
+    - traffic_cone
+
+# =============================================================================
+# Pillar Feature Net (PFN)
+# =============================================================================
+pillar_feature_net:
+  # Maximum number of non-empty pillars per frame
+  # nuScenes has denser point clouds due to 10-sweep aggregation
+  max_pillars: 30000
+
+  # Maximum points per pillar after random subsampling
+  max_points_per_pillar: 20
+
+  # Pillar spatial extent in x-y plane (meters)
+  # Slightly larger than KITTI (0.16m) to manage computational cost
+  # over the larger detection range
+  pillar_size: [0.2, 0.2]
+
+  # Per-point input features:
+  # x, y, z          - 3D coordinates of the point
+  # intensity        - LiDAR return intensity (reflectance)
+  # time_lag         - time offset from current sweep (for multi-sweep)
+  # xc, yc, zc      - offset from arithmetic mean of all points in the pillar
+  # xp, yp          - offset from the pillar center (x, y only)
+  num_point_features: 10
+
+  # Output feature dimension after PointNet-style encoding
+  output_channels: 64
+
+# =============================================================================
+# Point Cloud Range
+# =============================================================================
+point_cloud_range:
+  # [x_min, y_min, z_min, x_max, y_max, z_max]
+  # nuScenes uses full 360-degree detection (symmetric in x and y)
+  # x: -51.2 to 51.2m (front and rear)
+  # y: -51.2 to 51.2m (left and right)
+  # z: -5.0 to 3.0m (below ground level to above trucks)
+  range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+  # Derived grid dimensions:
+  # grid_x = (51.2 - (-51.2)) / 0.2 = 512
+  # grid_y = (51.2 - (-51.2)) / 0.2 = 512
+  # Pseudo-image shape: (64, 512, 512) = (C, H, W)
+
+# =============================================================================
+# 2D CNN Backbone
+# =============================================================================
+backbone_2d:
+  # Three downsampling blocks with progressive feature refinement
+  num_blocks: 3
+
+  blocks:
+    - name: block1
+      stride: 2
+      num_layers: 3
+      out_channels: 64
+    - name: block2
+      stride: 2
+      num_layers: 5
+      out_channels: 128
+    - name: block3
+      stride: 2
+      num_layers: 5
+      out_channels: 256
+
+  kernel_size: 3
+  padding: 1
+  bn_momentum: 0.1
+  activation: ReLU
+
+# =============================================================================
+# Neck (Feature Pyramid / Multi-Scale Fusion)
+# =============================================================================
+neck:
+  type: SECONDFPN
+  # Upsample all backbone block outputs to identical spatial resolution
+  # and concatenate for rich multi-scale feature representation
+  upsample_strides: [1, 2, 4]
+  upsample_channels: [128, 128, 128]
+
+  # Final output: 128 * 3 = 384 channels
+  output_channels: 384
+
+# =============================================================================
+# Detection Head (SSD-style Anchor-Based)
+# =============================================================================
+head:
+  type: AnchorHead
+  in_channels: 384
+
+  # Per-class anchor definitions with sizes derived from
+  # nuScenes training set mean object dimensions
+  anchors:
+    - class: car
+      # Anchor sizes: [length, width, height] in meters
+      size: [4.63, 1.97, 1.74]
+      anchor_height: -0.95
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.6
+      unmatched_threshold: 0.45
+
+    - class: truck
+      size: [6.93, 2.51, 2.84]
+      anchor_height: -0.40
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.55
+      unmatched_threshold: 0.40
+
+    - class: bus
+      size: [11.1, 2.95, 3.47]
+      anchor_height: -0.08
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.55
+      unmatched_threshold: 0.40
+
+    - class: trailer
+      size: [12.29, 2.90, 3.87]
+      anchor_height: 0.22
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.55
+      unmatched_threshold: 0.40
+
+    - class: construction_vehicle
+      size: [6.37, 2.85, 3.19]
+      anchor_height: -0.22
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.50
+      unmatched_threshold: 0.35
+
+    - class: pedestrian
+      size: [0.73, 0.67, 1.77]
+      anchor_height: -0.73
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.50
+      unmatched_threshold: 0.35
+
+    - class: motorcycle
+      size: [2.11, 0.77, 1.47]
+      anchor_height: -1.08
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.50
+      unmatched_threshold: 0.35
+
+    - class: bicycle
+      size: [1.70, 0.60, 1.28]
+      anchor_height: -1.18
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.50
+      unmatched_threshold: 0.35
+
+    - class: barrier
+      size: [0.50, 2.53, 0.98]
+      anchor_height: -1.33
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.50
+      unmatched_threshold: 0.35
+
+    - class: traffic_cone
+      size: [0.41, 0.41, 1.07]
+      anchor_height: -1.27
+      rotations: [0, 1.5707963]
+      matched_threshold: 0.50
+      unmatched_threshold: 0.35
+
+  # Bounding box regression: (x, y, z, w, l, h, theta, vx, vy) = 9 params
+  # nuScenes includes velocity estimation
+  num_box_params: 9
+
+  # Direction classification head
+  direction_classification:
+    enabled: true
+    num_bins: 2
+    offset: 0.78539  # pi/4
+
+# =============================================================================
+# Loss Configuration
+# =============================================================================
+loss:
+  # Focal loss for classification
+  classification:
+    type: FocalLoss
+    alpha: 0.25
+    gamma: 2.0
+    weight: 1.0
+
+  # Smooth L1 for bounding box regression
+  regression:
+    type: SmoothL1Loss
+    beta: 1.0
+    weight: 2.0
+    # Per-parameter weights: x, y, z, w, l, h, theta, vx, vy
+    code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+
+  # Direction classification loss
+  direction:
+    type: CrossEntropyLoss
+    weight: 0.2
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  epochs: 20          # nuScenes uses fewer epochs with larger dataset
+  batch_size: 4       # Per GPU; larger point clouds require more memory
+  num_workers: 4
+  seed: 42
+
+  # -----------------------------------------------------------------------------
+  # Optimizer
+  # -----------------------------------------------------------------------------
+  optimizer:
+    type: Adam
+    lr: 0.001         # 1e-3 initial learning rate
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+  # -----------------------------------------------------------------------------
+  # Learning Rate Schedule: One-Cycle Policy
+  # -----------------------------------------------------------------------------
+  scheduler:
+    type: OneCycleLR
+    max_lr: 0.001
+    pct_start: 0.4
+    anneal_strategy: cos
+    div_factor: 10
+    final_div_factor: 100
+
+  # -----------------------------------------------------------------------------
+  # Gradient Clipping
+  # -----------------------------------------------------------------------------
+  gradient_clip:
+    type: norm
+    max_norm: 35.0
+
+  # Distributed training settings
+  distributed:
+    backend: nccl
+    sync_bn: true
+    num_gpus: 8
+
+# =============================================================================
+# Data Augmentation
+# =============================================================================
+augmentation:
+  # Ground-truth database sampling
+  gt_sampling:
+    enabled: true
+    db_info_path: data/nuscenes/dbinfos_train_10sweeps.pkl
+    sample_groups:
+      car: 15
+      truck: 3
+      bus: 4
+      trailer: 6
+      construction_vehicle: 7
+      pedestrian: 10
+      motorcycle: 6
+      bicycle: 6
+      barrier: 10
+      traffic_cone: 10
+    min_points:
+      car: 5
+      truck: 5
+      bus: 5
+      trailer: 5
+      construction_vehicle: 5
+      pedestrian: 5
+      motorcycle: 5
+      bicycle: 5
+      barrier: 5
+      traffic_cone: 5
+
+  # Global random rotation around z-axis
+  random_rotation:
+    enabled: true
+    range: [-0.3927, 0.3927]  # [-pi/8, pi/8] radians (smaller for nuScenes)
+
+  # Global random scaling
+  random_scaling:
+    enabled: true
+    range: [0.95, 1.05]
+
+  # Global random translation
+  random_translation:
+    enabled: true
+    std: [0.5, 0.5, 0.5]  # Larger std for nuScenes (bigger scenes)
+
+  # Random flip in both directions (360-degree detection)
+  random_flip:
+    enabled: true
+    x_axis: true
+    y_axis: true    # Both axes valid for 360-degree detection
+
+  point_shuffle:
+    enabled: true
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  dataset: nuScenes
+
+  # nuScenes detection metrics
+  metrics:
+    - mAP          # Mean Average Precision (distance-based matching)
+    - NDS          # nuScenes Detection Score (weighted combination)
+    - mATE         # Mean Average Translation Error (meters)
+    - mASE         # Mean Average Scale Error (1 - IoU after alignment)
+    - mAOE         # Mean Average Orientation Error (radians)
+    - mAVE         # Mean Average Velocity Error (m/s)
+    - mAAE         # Mean Average Attribute Error (1 - accuracy)
+
+  # Distance-based matching thresholds (meters)
+  # Unlike KITTI's IoU-based matching, nuScenes uses center distance
+  dist_thresholds: [0.5, 1.0, 2.0, 4.0]
+
+  # NDS weighting: mAP contributes 50%, other metrics share remaining 50%
+  nds_weights:
+    mAP: 5.0
+    mATE: 1.0
+    mASE: 1.0
+    mAOE: 1.0
+    mAVE: 1.0
+    mAAE: 1.0
+
+  eval_frequency: 2  # Evaluate every 2 epochs
+  score_threshold: 0.1
+
+# =============================================================================
+# Inference
+# =============================================================================
+inference:
+  batch_size: 1
+  score_threshold: 0.1
+  nms:
+    type: rotated_nms
+    iou_threshold: 0.2
+    pre_max_size: 1000
+    post_max_size: 83   # nuScenes submission limit per sample
+  output_format: nuscenes_submission

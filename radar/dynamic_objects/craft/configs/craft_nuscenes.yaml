@@ -1,0 +1,198 @@
+# CRAFT (Camera-Radar Fusion Transformer) Configuration
+# Dataset: nuScenes
+# Task: 3D Object Detection with Camera-Radar Fusion
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  name: "CRAFT"
+
+  backbone:
+    type: "resnet50"
+    pretrained: true
+    frozen_stages: 1
+    norm_type: "BN"
+    out_indices: [1, 2, 3, 4]
+
+  neck:
+    type: "FPN"
+    in_channels: [256, 512, 1024, 2048]
+    out_channels: 256
+    num_outs: 5
+    start_level: 1
+    add_extra_convs: "on_output"
+
+  radar_pillar_encoder:
+    voxel_size: [0.2, 0.2, 8.0]
+    point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+    max_points_per_pillar: 20
+    max_pillars: 30000
+    in_channels: 18  # x, y, z, rcs, vx_comp, vy_comp + additional radar features
+    out_channels: 64
+    num_filters: [64, 128]
+
+  fusion_transformer:
+    d_model: 256
+    n_heads: 8
+    n_layers: 6
+    d_ffn: 1024
+    dropout: 0.1
+    activation: "relu"
+    normalize_before: true
+    positional_encoding:
+      type: "learned"
+      num_feats: 128
+    cross_attention:
+      type: "deformable"
+      n_points: 4
+      n_levels: 4
+
+  detection_head:
+    num_classes: 10
+    in_channels: 256
+    heatmap_channels: 256
+    regression_channels: 256
+    num_heatmap_convs: 2
+    num_regression_convs: 3
+    bbox_code_size: 10  # x, y, z, w, l, h, sin, cos, vx, vy
+    shared_conv_channels: 64
+    bias_heatmap: -2.19  # focal loss init bias
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  dataset: "nuScenes"
+  version: "v1.0-trainval"
+  root_path: "/data/nuscenes"
+  info_path:
+    train: "/data/nuscenes/nuscenes_infos_train.pkl"
+    val: "/data/nuscenes/nuscenes_infos_val.pkl"
+    test: "/data/nuscenes/nuscenes_infos_test.pkl"
+
+  image:
+    size: [900, 1600]  # height, width
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+  point_cloud:
+    range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+    voxel_size: [0.2, 0.2, 8.0]
+    max_points_per_pillar: 20
+    max_pillars: 30000
+    num_sweeps: 6
+    radar_use_dims: [0, 1, 2, 3, 4, 5, 8, 9, 18]  # selected radar feature dims
+
+  augmentation:
+    flip_prob: 0.5
+    rotation_range: [-0.3925, 0.3925]  # +/- 22.5 degrees in radians
+    scale_range: [0.95, 1.05]
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+    random_crop:
+      enabled: false
+    grid_mask:
+      enabled: true
+      prob: 0.7
+      fixed_prob: true
+
+  num_workers: 4
+  pin_memory: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 4
+  epochs: 20
+  warmup_epochs: 2
+
+  optimizer:
+    type: "adamw"
+    lr: 2.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  scheduler:
+    type: "onecycle"
+    max_lr: 2.0e-4
+    pct_start: 0.1
+    anneal_strategy: "cos"
+    div_factor: 10.0
+    final_div_factor: 1000.0
+
+  loss_weights:
+    classification: 1.0
+    bbox_regression: 2.0
+    velocity: 0.2
+
+  gradient_clip_norm: 35.0
+
+  ema:
+    enabled: true
+    decay: 0.999
+
+  mixed_precision:
+    enabled: true
+    opt_level: "O1"
+
+  sync_bn: true
+  find_unused_parameters: false
+
+  checkpoint:
+    save_interval: 1
+    save_best: true
+    monitor_metric: "mAP"
+    max_keep: 5
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  score_threshold: 0.1
+  nms_threshold: 0.2
+  max_detections: 500
+  metrics:
+    - "mAP"
+    - "NDS"
+    - "mATE"
+    - "mASE"
+    - "mAOE"
+    - "mAVE"
+    - "mAAE"
+  eval_frequency: 1  # evaluate every N epochs
+  use_external_evaluator: true  # use nuScenes official evaluation
+
+# -----------------------------------------------------------------------------
+# Class Names (nuScenes 10-class detection task)
+# -----------------------------------------------------------------------------
+class_names:
+  - "car"
+  - "truck"
+  - "construction_vehicle"
+  - "bus"
+  - "trailer"
+  - "barrier"
+  - "motorcycle"
+  - "bicycle"
+  - "pedestrian"
+  - "traffic_cone"
+
+# -----------------------------------------------------------------------------
+# Runtime Configuration
+# -----------------------------------------------------------------------------
+runtime:
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+  distributed:
+    backend: "nccl"
+    world_size: 1
+  log_interval: 50
+  work_dir: "./work_dirs/craft_nuscenes"

@@ -1,0 +1,368 @@
+# CenterPoint Voxel-Based Configuration
+# Target: nuScenes dataset
+# Reference: "Center-based 3D Object Detection and Tracking" (Yin et al., CVPR 2021)
+
+model:
+  type: CenterPoint
+  variant: voxel
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  dataset: nuScenes
+  version: v1.0-trainval
+  root_path: data/nuscenes/
+  info_path:
+    train: data/nuscenes/infos_train_10sweeps.pkl
+    val: data/nuscenes/infos_val_10sweeps.pkl
+    test: data/nuscenes/infos_test_10sweeps.pkl
+  nsweeps: 10
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+# ============================================================================
+# Voxelization
+# ============================================================================
+voxelization:
+  type: dynamic
+  voxel_size: [0.075, 0.075, 0.2]
+  point_cloud_range: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+  max_points_per_voxel: 10
+  max_voxels:
+    train: 120000
+    val: 160000
+    test: 160000
+  # Derived grid dimensions: [1440, 1440, 40]
+
+# ============================================================================
+# Point Feature Encoding
+# ============================================================================
+point_encoding:
+  type: MeanVFE
+  in_channels: 5  # x, y, z, intensity, time_lag
+  # Output: mean of point features within each voxel
+
+# ============================================================================
+# 3D Sparse Convolutional Backbone
+# ============================================================================
+backbone_3d:
+  type: SparseBEVBackbone
+  in_channels: 5
+  sparse_shape: [40, 1440, 1440]  # Z, Y, X
+  stages:
+    - name: stage1
+      out_channels: 16
+      num_blocks: 2
+      stride: 1
+      conv_type: SubMConv3d
+      kernel_size: 3
+      padding: 1
+    - name: stage2
+      out_channels: 32
+      num_blocks: 3
+      stride: 2
+      conv_type: [SparseConv3d, SubMConv3d, SubMConv3d]
+      kernel_size: 3
+      padding: 1
+    - name: stage3
+      out_channels: 64
+      num_blocks: 3
+      stride: 2
+      conv_type: [SparseConv3d, SubMConv3d, SubMConv3d]
+      kernel_size: 3
+      padding: 1
+    - name: stage4
+      out_channels: 128
+      num_blocks: 3
+      stride: 2
+      conv_type: [SparseConv3d, SubMConv3d, SubMConv3d]
+      kernel_size: 3
+      padding: 1
+  # Z-axis compression
+  z_compress:
+    kernel_size: [3, 1, 1]
+    stride: [2, 1, 1]
+    padding: [1, 0, 0]
+    out_channels: 128
+  # Output spatial shape: [2, 180, 180] with 128 channels
+
+# ============================================================================
+# BEV Collapse
+# ============================================================================
+bev_collapse:
+  type: HeightCompression
+  input_channels: 128
+  num_z_features: 2
+  output_channels: 256  # 128 * 2 = 256
+
+# ============================================================================
+# 2D Backbone (BEV Feature Refinement)
+# ============================================================================
+backbone_2d:
+  type: ResNetBEV
+  in_channels: 256
+  stages:
+    - num_blocks: 5
+      out_channels: 128
+      stride: 1
+    - num_blocks: 5
+      out_channels: 256
+      stride: 2
+  # Deconvolution / Upsample
+  deconv:
+    - in_channels: 128
+      out_channels: 128
+      kernel_size: 1
+      stride: 1
+    - in_channels: 256
+      out_channels: 128
+      kernel_size: 2
+      stride: 2
+  # Final output: concatenation of deconv outputs = 256 channels at 180x180
+
+# ============================================================================
+# Detection Head
+# ============================================================================
+head:
+  type: CenterHead
+  in_channels: 256
+  shared_conv_channels: 64
+  init_bias: -2.19  # = -log((1 - 0.1) / 0.1) for focal loss initialization
+
+  # Separate heads per class group
+  class_groups:
+    - name: car
+      classes: [car]
+      num_classes: 1
+    - name: truck
+      classes: [truck, construction_vehicle]
+      num_classes: 2
+    - name: bus
+      classes: [bus, trailer]
+      num_classes: 2
+    - name: barrier
+      classes: [barrier]
+      num_classes: 1
+    - name: two_wheel
+      classes: [motorcycle, bicycle]
+      num_classes: 2
+    - name: pedestrian
+      classes: [pedestrian, traffic_cone]
+      num_classes: 2
+
+  # Regression heads configuration
+  regression_heads:
+    offset:
+      channels: 2
+      description: "Sub-voxel center offset (dx, dy)"
+    height:
+      channels: 1
+      description: "Absolute height of object center (z)"
+    size:
+      channels: 3
+      description: "Log-normalized dimensions (log_w, log_l, log_h)"
+    rotation:
+      channels: 2
+      description: "Yaw angle as (sin_theta, cos_theta)"
+    velocity:
+      channels: 2
+      description: "BEV velocity (vx, vy) in m/s"
+
+  # Peak extraction at inference
+  post_processing:
+    max_detections_per_head: 500
+    nms_kernel_size: 3  # Max pooling for peak detection
+    score_threshold: 0.1
+    nms_iou_threshold: null  # CenterPoint typically doesn't use traditional NMS
+
+# ============================================================================
+# Two-Stage Refinement (Optional)
+# ============================================================================
+two_stage:
+  enabled: true
+  feature_extraction:
+    type: BEVBilinear
+    num_sample_points: 5  # center + 4 face centers
+    feature_channels: 256
+  mlp:
+    hidden_dims: [256, 256]
+    dropout: 0.0
+    batch_norm: true
+  loss:
+    cls: BinaryCrossEntropy
+    reg: SmoothL1
+    cls_weight: 1.0
+    reg_weight: 2.0
+  target_assigner:
+    pos_iou_threshold: 0.55
+    neg_iou_threshold: 0.25
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+loss:
+  heatmap:
+    type: GaussianFocalLoss
+    alpha: 2.0
+    beta: 4.0
+    weight: 1.0
+  offset:
+    type: L1Loss
+    weight: 2.0
+  height:
+    type: L1Loss
+    weight: 2.0
+  size:
+    type: L1Loss
+    weight: 0.2
+  rotation:
+    type: L1Loss
+    weight: 1.0
+  velocity:
+    type: L1Loss
+    weight: 0.2
+
+# Gaussian radius for heatmap target generation
+gaussian_overlap: 0.1
+min_radius: 2
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  epochs: 20
+  batch_size: 4  # per GPU
+  num_workers: 4
+  seed: 42
+
+  optimizer:
+    type: AdamW
+    lr: 0.001
+    betas: [0.9, 0.99]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+  scheduler:
+    type: OneCycleLR
+    max_lr: 0.001
+    pct_start: 0.4
+    anneal_strategy: cos
+    div_factor: 10
+    final_div_factor: 100
+
+  gradient_clip:
+    type: norm
+    max_norm: 35.0
+
+  # Augmentation fade strategy
+  fade:
+    enabled: true
+    fade_epochs: 5  # Disable augmentation for last 5 epochs
+
+  # Distributed training
+  distributed:
+    backend: nccl
+    sync_bn: true
+    num_gpus: 8
+
+# ============================================================================
+# Data Augmentation
+# ============================================================================
+augmentation:
+  gt_sampling:
+    enabled: true
+    db_info_path: data/nuscenes/dbinfos_train_10sweeps.pkl
+    sample_groups:
+      car: 15
+      truck: 3
+      construction_vehicle: 7
+      bus: 4
+      trailer: 6
+      barrier: 10
+      motorcycle: 6
+      bicycle: 6
+      pedestrian: 10
+      traffic_cone: 10
+    min_points:
+      car: 5
+      truck: 5
+      construction_vehicle: 5
+      bus: 5
+      trailer: 5
+      barrier: 5
+      motorcycle: 5
+      bicycle: 5
+      pedestrian: 5
+      traffic_cone: 5
+
+  random_rotation:
+    enabled: true
+    range: [-0.7854, 0.7854]  # [-pi/4, pi/4]
+
+  random_scaling:
+    enabled: true
+    range: [0.95, 1.05]
+
+  random_translation:
+    enabled: true
+    std: [0.2, 0.2, 0.2]
+
+  random_flip:
+    enabled: true
+    x_axis: true
+    y_axis: true
+
+  point_shuffle:
+    enabled: true
+
+# ============================================================================
+# Tracking Configuration
+# ============================================================================
+tracking:
+  type: GreedyCenterDistance
+  max_age: 3
+  dist_threshold: 4.0  # meters
+  velocity_weight: 1.0
+  min_hits: 1
+
+# ============================================================================
+# Evaluation
+# ============================================================================
+evaluation:
+  dataset: nuScenes
+  metrics:
+    - NDS
+    - mAP
+    - mATE
+    - mASE
+    - mAOE
+    - mAVE
+    - mAAE
+  tracking_metrics:
+    - AMOTA
+    - AMOTP
+    - IDS
+    - FRAG
+  eval_frequency: 1  # Evaluate every N epochs
+  score_threshold: 0.1
+  dist_thresholds: [0.5, 1.0, 2.0, 4.0]
+
+# ============================================================================
+# Inference
+# ============================================================================
+inference:
+  batch_size: 1
+  score_threshold: 0.1
+  max_detections: 500
+  use_two_stage: true
+  output_format: nuscenes_submission

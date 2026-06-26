@@ -1,0 +1,384 @@
+# =============================================================================
+# PETRv2 Configuration - ResNet-50 Backbone with Temporal Fusion
+# =============================================================================
+# Training configuration for PETRv2, extending PETR with temporal modeling
+# and multi-task learning capabilities.
+#
+# Key Extensions over PETR:
+# 1. Temporal Alignment: Aligns previous frame features to current frame using
+#    ego-motion compensation, enabling temporal feature fusion across frames.
+# 2. Multi-task Heads: Supports joint detection + BEV segmentation training.
+# 3. 2D/3D Position Embedding: Adds 2D positional encoding alongside 3D PE
+#    for richer spatial representation.
+#
+# Reference: PETRv2: A Unified Framework for 3D Perception from Multi-Camera
+#            Images (ICCV 2023)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  type: petrv2
+
+  # --- Image Backbone ---
+  backbone:
+    type: resnet50
+    # ImageNet pretrained for transfer learning
+    pretrained: true
+    pretrained_weights: imagenet
+    # Output multi-scale features from stages C3, C4, C5
+    out_indices: [1, 2, 3]
+    # Freeze first stage to preserve low-level features
+    frozen_stages: 1
+    # Fix BN statistics for stable small-batch training
+    norm_eval: true
+    norm_cfg:
+      type: BN
+      requires_grad: false
+
+  # --- Feature Pyramid Network (Neck) ---
+  neck:
+    type: fpn
+    # Input channels from ResNet-50 stages
+    in_channels: [512, 1024, 2048]
+    # Unified output dimension
+    out_channels: 256
+    num_outs: 3
+    start_level: 0
+    add_extra_convs: on_input
+    relu_before_extra_convs: true
+
+  # --- 3D Position Embedding Generator ---
+  position_embedding:
+    # Frustum depth discretization parameters
+    depth_start: 1.0
+    depth_end: 61.2
+    depth_step: 0.956
+    depth_num: 64
+
+    # 3D position encoding MLP
+    position_mlp:
+      input_dim: 3
+      hidden_dim: 1024
+      output_dim: 256
+      num_layers: 2
+      activation: relu
+
+    # Coordinate normalization
+    normalize_coords: true
+    pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+    # PETRv2 addition: 2D position embedding
+    # Adds 2D camera-plane positional encoding to complement 3D PE
+    # Helps the model retain fine-grained spatial information from images
+    use_2d_pe: true
+    pe_2d_type: learned    # 'learned' or 'sinusoidal'
+    pe_2d_dim: 256
+
+    # LID (Linear Increasing Discretization) for non-uniform depth sampling
+    # Provides finer granularity at close range, coarser at far range
+    use_lid: true
+
+  # --- Temporal Alignment Module ---
+  # PETRv2's key addition: aligns previous frame features to current frame
+  temporal:
+    # Number of temporal frames to aggregate (including current frame)
+    # 2 = current + 1 previous frame
+    num_temporal_frames: 2
+
+    # Temporal alignment configuration
+    temporal_alignment:
+      # Compensate for ego-vehicle motion between frames
+      # Transforms previous frame 3D coordinates to current frame using
+      # the ego-motion transformation matrix (from CAN bus / localization)
+      ego_motion_compensation: true
+
+      # Align image features from previous frames
+      # Previous frame 3D PEs are transformed to current frame's coordinate
+      # system before being added to image features
+      feature_alignment: true
+
+      # Whether to use a separate temporal attention layer
+      # If false, temporal features are simply concatenated with current features
+      temporal_attention: false
+
+      # Decay factor for previous frame features (exponential weighting)
+      # Lower values give less weight to older frames
+      temporal_decay: 0.9
+
+    # Whether to detach gradients from previous frame features
+    # Prevents gradient flow through time for memory efficiency
+    detach_temporal: true
+
+    # Maximum time gap (seconds) to accept temporal frames
+    # If gap exceeds this, treat as a new sequence (no temporal fusion)
+    max_time_gap: 2.0
+
+  # --- Transformer Decoder ---
+  decoder:
+    # Number of decoder layers
+    num_decoder_layers: 6
+
+    # Number of object queries
+    num_queries: 900
+
+    # Feature dimension
+    embed_dims: 256
+
+    # Multi-head attention configuration
+    num_heads: 8
+
+    # Feed-forward network dimension
+    ffn_dim: 2048
+
+    # Dropout rate
+    dropout: 0.1
+
+    # Standard (full) cross-attention
+    attention_type: standard
+
+    # Pre-normalization
+    pre_norm: false
+
+    # Return intermediate outputs for auxiliary losses
+    return_intermediate: true
+
+  # --- Detection Head ---
+  head:
+    # Number of detection classes (nuScenes 10 classes)
+    num_classes: 10
+
+    # Bounding box code size: (cx, cy, cz, w, l, h, sin, cos, vx, vy)
+    code_size: 10
+
+    # Number of FC layers in prediction heads
+    num_reg_fcs: 2
+
+    # Sigmoid classification
+    use_sigmoid: true
+
+    # Separate cls/reg heads
+    shared_head: false
+
+    # Code weights for regression targets
+    code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+
+  # --- Multi-task Heads (PETRv2 Extension) ---
+  # Optional BEV segmentation head for multi-task learning
+  multi_task:
+    # Enable/disable BEV segmentation auxiliary task
+    bev_segmentation:
+      enabled: false
+      # BEV grid resolution for segmentation output
+      bev_h: 200
+      bev_w: 200
+      # Segmentation classes (drivable area, lane boundaries, etc.)
+      num_seg_classes: 6
+      # Loss weight for segmentation task
+      seg_loss_weight: 1.0
+      # Segmentation head architecture
+      seg_head:
+        type: conv
+        num_convs: 3
+        in_channels: 256
+        out_channels: 6
+        kernel_size: 3
+
+    # Optional depth estimation auxiliary task
+    depth_estimation:
+      enabled: false
+      # Number of depth bins for depth prediction
+      num_depth_bins: 64
+      depth_loss_weight: 0.1
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Dataset type
+  dataset: nuscenes
+
+  # Data root directory
+  data_root: ./data/nuscenes/
+
+  # Annotation files (must include temporal info for frame linking)
+  train_ann: nuscenes_infos_temporal_train.pkl
+  val_ann: nuscenes_infos_temporal_val.pkl
+
+  # Input image size [height, width]
+  img_size: [900, 1600]
+
+  # Number of cameras
+  num_cams: 6
+
+  # Detection classes
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+  # 3D perception range
+  pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+  # Temporal data loading
+  temporal:
+    # Number of previous frames to load per sample
+    num_prev_frames: 1
+    # Whether to load sequential frames (vs random from same scene)
+    sequential: true
+    # Key frame interval in the dataset (nuScenes keyframes are 0.5s apart)
+    key_frame_interval: 0.5
+
+  # Data augmentation
+  augmentation:
+    resize: [0.38, 0.55]
+    rotation: [-5.4, 5.4]
+    flip: 0.5
+    grid_mask:
+      enabled: true
+      probability: 0.7
+      x_range: [64, 128]
+      y_range: [64, 128]
+      ratio: 0.5
+    color_jitter:
+      enabled: true
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+
+  # Data loading
+  workers_per_gpu: 4
+  shuffle: true
+  pin_memory: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Total training epochs
+  epochs: 24
+
+  # Batch size per GPU (memory-intensive with temporal frames)
+  batch_size: 1
+
+  # Number of GPUs
+  num_gpus: 8
+
+  # Effective batch size = 8
+
+  # Optimizer
+  optimizer: AdamW
+  lr: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+  # Gradient clipping
+  grad_clip: 35.0
+
+  # Learning rate schedule
+  lr_schedule:
+    type: cosine
+    warmup: linear
+    warmup_iters: 500
+    warmup_ratio: 0.33
+    min_lr_ratio: 1.0e-3
+
+  # Backbone LR multiplier (lower for pretrained layers)
+  backbone_lr_mult: 0.1
+
+  # Mixed precision training
+  mixed_precision: true
+  fp16_loss_scale: dynamic
+
+  # EMA (disabled by default)
+  ema: false
+
+  # Checkpointing
+  checkpoint_interval: 1
+  eval_interval: 1
+
+  # Resume
+  resume_from: null
+
+  # Reproducibility
+  seed: 0
+
+  # Distributed training
+  dist_backend: nccl
+
+  # Class-balanced grouping and sampling
+  cbgs: false
+
+  # Gradient accumulation steps (useful if batch_size must be reduced)
+  accumulate_grad_batches: 1
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Classification loss
+  cls_loss:
+    type: focal_loss
+    alpha: 0.25
+    gamma: 2.0
+    weight: 2.0
+
+  # Bounding box regression loss
+  bbox_loss:
+    type: l1_loss
+    weight: 0.25
+
+  # IoU loss (not used)
+  iou_loss:
+    type: none
+    weight: 0.0
+
+  # Hungarian matcher
+  matcher:
+    type: hungarian
+    cls_cost: 2.0
+    bbox_cost: 0.25
+    iou_cost: 0.0
+
+  # Auxiliary losses from intermediate decoder layers
+  auxiliary_loss: true
+
+  # Temporal consistency loss (optional)
+  # Encourages consistent predictions across temporal frames
+  temporal_loss:
+    enabled: false
+    type: l1_loss
+    weight: 0.1
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  # nuScenes metrics
+  metrics:
+    - mAP
+    - NDS
+    - mATE
+    - mASE
+    - mAOE
+    - mAVE
+    - mAAE
+
+  # Post-processing
+  nms:
+    enabled: true
+    score_threshold: 0.1
+    max_per_frame: 300
+
+  # Expected performance (PETRv2-R50 on nuScenes val):
+  # mAP: ~34.6, NDS: ~42.1
+  # Temporal fusion provides ~3 mAP improvement over PETR base

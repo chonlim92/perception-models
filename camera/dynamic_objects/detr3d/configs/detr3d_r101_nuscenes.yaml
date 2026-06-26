@@ -1,0 +1,53 @@
+model:
+  backbone: resnet101
+  fpn_channels: 256
+  num_queries: 900
+  query_dim: 256
+  num_decoder_layers: 6
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1
+  num_classes: 10
+  detection_range: [[-51.2, -51.2, -5.0], [51.2, 51.2, 3.0]]
+  code_size: 10  # cx, cy, cz, w, l, h, sin, cos, vx, vy
+
+data:
+  dataset: nuscenes
+  version: v1.0-trainval
+  data_root: ./data/nuscenes
+  train_split: train
+  val_split: val
+  num_cameras: 6
+  camera_names: [CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT]
+  image_size: [900, 1600]
+  resize_to: [256, 704]
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+  class_names: [car, truck, construction_vehicle, bus, trailer, barrier, motorcycle, bicycle, pedestrian, traffic_cone]
+
+training:
+  epochs: 24
+  batch_size: 1
+  num_workers: 4
+  optimizer: adamw
+  learning_rate: 2.0e-4
+  backbone_lr_factor: 0.1
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 1
+  grad_clip_norm: 35.0
+  aux_loss: true
+  checkpoint_interval: 4
+
+loss:
+  cls_weight: 2.0
+  bbox_weight: 0.25
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  matcher_cls_cost: 2.0
+  matcher_bbox_cost: 0.25
+
+evaluation:
+  score_threshold: 0.1
+  max_detections: 300
+  distance_thresholds: [0.5, 1.0, 2.0, 4.0]

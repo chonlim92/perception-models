@@ -1,0 +1,298 @@
+# =============================================================================
+# BEVFormer Base Configuration
+# =============================================================================
+# Full training configuration for the BEVFormer base model.
+# BEVFormer transforms multi-camera images into a unified Bird's-Eye-View (BEV)
+# representation using spatial cross-attention and temporal self-attention,
+# then performs 3D object detection via a transformer decoder.
+#
+# Reference: BEVFormer: Learning Bird's-Eye-View Representation from
+#            Multi-Camera Images via Spatiotemporal Transformers (ECCV 2022)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  # --- Image Backbone ---
+  backbone:
+    type: resnet101
+    # Use ImageNet-pretrained weights for faster convergence and better features
+    pretrained: true
+    pretrained_weights: imagenet
+    # Return feature maps from stages 3, 4, 5 (C3, C4, C5)
+    # These correspond to 1/8, 1/16, 1/32 resolution respectively
+    out_indices: [2, 3, 4]
+    # Freeze batch norm in backbone to stabilize training with small batch sizes
+    frozen_stages: 1
+    norm_eval: true
+
+  # --- Feature Pyramid Network (Neck) ---
+  neck:
+    type: fpn
+    # Input channels from ResNet-101 stages C3, C4, C5
+    in_channels: [512, 1024, 2048]
+    # Unified output channel dimension across all FPN levels
+    out_channels: 256
+    # Number of output feature levels (P3, P4, P5, P6 via extra convolution)
+    num_outs: 4
+    # Start from stage index 1 (C4) for top-down pathway
+    start_level: 1
+    # Add extra convolution for the coarsest level
+    add_extra_convs: on_output
+
+  # --- BEV Encoder (Spatial-Temporal Transformer) ---
+  bev_encoder:
+    # Embedding dimension for BEV queries and transformer layers
+    embed_dims: 256
+
+    # BEV grid resolution: 200x200 covers the perception range
+    # Each cell represents (102.4m / 200) = 0.512m
+    bev_h: 200
+    bev_w: 200
+
+    # Number of transformer encoder layers for BEV feature refinement
+    # Each layer performs temporal self-attention + spatial cross-attention
+    num_encoder_layers: 6
+
+    # Multi-head attention configuration
+    num_heads: 8
+
+    # Number of sampling points for deformable spatial cross-attention
+    # More points = better coverage of image features but higher compute
+    num_points_spatial: 4
+
+    # Number of sampling points for temporal self-attention
+    # Samples from previous BEV features for motion-aware representation
+    num_points_temporal: 4
+
+    # Number of multi-scale feature levels from FPN used in cross-attention
+    num_levels: 4
+
+    # Number of surrounding cameras (nuScenes uses 6: front, front-left,
+    # front-right, back, back-left, back-right)
+    num_cams: 6
+
+    # Point cloud range defining the 3D perception volume [x_min, y_min, z_min, x_max, y_max, z_max]
+    # Covers 102.4m x 102.4m x 8m centered on the ego vehicle
+    pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+    # Number of 3D reference points per BEV query for spatial cross-attention
+    # These are sampled along the height (z-axis) to project into camera views
+    num_ref_points: 4
+
+  # --- Transformer Decoder (Detection Head Transformer) ---
+  decoder:
+    # Number of decoder layers; each refines object queries
+    num_decoder_layers: 6
+
+    # Number of object queries (maximum detectable objects per frame)
+    # Set higher than expected max objects for sufficient recall
+    num_queries: 900
+
+    # Feature dimension (must match BEV encoder embed_dims)
+    embed_dims: 256
+
+    # Multi-head attention heads in decoder self/cross-attention
+    num_heads: 8
+
+    # Feed-forward network intermediate dimension
+    ffn_dim: 2048
+
+    # Dropout rate in attention and FFN layers
+    dropout: 0.1
+
+    # Use iterative bounding box refinement across decoder layers
+    iterative_bbox_refinement: true
+
+  # --- Detection Head ---
+  head:
+    # Number of object classes in nuScenes detection benchmark
+    num_classes: 10
+
+    # Bounding box code size: (cx, cy, cz, w, l, h, sin(yaw), cos(yaw), vx, vy)
+    # cx/cy/cz: center coordinates
+    # w/l/h: width, length, height
+    # sin/cos: yaw angle decomposed for smooth regression
+    # vx/vy: velocity components
+    code_size: 10
+
+    # Shared convolution layers in classification and regression branches
+    num_reg_fcs: 2
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Dataset type
+  dataset: nuscenes
+
+  # Root directory for nuScenes dataset
+  data_root: ./data/nuscenes/
+
+  # Annotation files (pre-generated with temporal info for BEV training)
+  train_ann: nuscenes_infos_temporal_train.pkl
+  val_ann: nuscenes_infos_temporal_val.pkl
+
+  # Input image size [height, width] from nuScenes cameras
+  img_size: [900, 1600]
+
+  # Number of previous frames used for temporal BEV fusion
+  # More frames provide richer motion context but increase memory usage
+  num_temporal_frames: 4
+
+  # Detection classes in nuScenes (order matters for class indices)
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+  # Data augmentation configuration
+  augmentation:
+    # Random resize ratio range applied to images
+    # Final resolution after resize is approximately [342-495, 608-880]
+    resize: [0.38, 0.55]
+
+    # Random rotation range in degrees applied to BEV space
+    rotation: [-5.4, 5.4]
+
+    # Horizontal flip probability
+    flip: 0.5
+
+    # GridMask augmentation: randomly masks rectangular regions of the input
+    # Helps prevent overfitting to specific spatial patterns
+    grid_mask:
+      enabled: true
+      probability: 0.7
+      # GridMask parameters
+      x_range: [64, 128]
+      y_range: [64, 128]
+      ratio: 0.5
+
+  # Data loading
+  workers_per_gpu: 4
+  shuffle: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Total training epochs
+  epochs: 24
+
+  # Batch size per GPU (BEVFormer is memory-intensive due to multi-camera input)
+  batch_size: 1
+
+  # Number of GPUs for distributed training
+  num_gpus: 8
+
+  # Effective batch size = batch_size * num_gpus = 8
+
+  # Optimizer configuration
+  optimizer: AdamW
+  lr: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+  # Gradient clipping to prevent exploding gradients with transformer training
+  grad_clip: 35.0
+
+  # Learning rate schedule
+  lr_schedule:
+    # Cosine annealing for smooth LR decay
+    type: cosine
+    # Linear warmup at the start of training
+    warmup: linear
+    # Number of warmup iterations
+    warmup_iters: 500
+    # Initial LR ratio during warmup (start_lr = lr * warmup_ratio)
+    warmup_ratio: 0.33
+    # Minimum LR ratio at end of cosine schedule (min_lr = lr * min_lr_ratio)
+    min_lr_ratio: 1.0e-3
+
+  # Backbone learning rate multiplier (lower LR for pretrained backbone)
+  backbone_lr_mult: 0.1
+
+  # Mixed precision training (FP16) to reduce memory and speed up training
+  mixed_precision: true
+  fp16_loss_scale: dynamic
+
+  # Exponential moving average of model weights (disabled for base config)
+  ema: false
+
+  # Save checkpoint every N epochs
+  checkpoint_interval: 1
+
+  # Run validation every N epochs
+  eval_interval: 1
+
+  # Resume training from checkpoint (set path or null)
+  resume_from: null
+
+  # Seed for reproducibility
+  seed: 0
+
+  # Distributed training backend
+  dist_backend: nccl
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Classification loss: Focal Loss for handling class imbalance
+  cls_loss:
+    type: focal_loss
+    # Balancing factor for positive/negative examples
+    alpha: 0.25
+    # Focusing parameter (higher gamma = more focus on hard examples)
+    gamma: 2.0
+    # Loss weight in total loss computation
+    weight: 2.0
+
+  # Bounding box regression loss: L1 loss on normalized coordinates
+  bbox_loss:
+    type: l1_loss
+    # Loss weight (lower than cls to balance gradient magnitudes)
+    weight: 0.25
+
+  # IoU loss: not used in base BEVFormer (set to none)
+  iou_loss:
+    type: none
+    weight: 0.0
+
+  # Hungarian matcher for bipartite matching between predictions and GT
+  matcher:
+    type: hungarian
+    # Cost weights for matching (should align with loss weights)
+    cls_cost: 2.0
+    bbox_cost: 0.25
+    iou_cost: 0.0
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  # nuScenes detection metrics
+  metrics:
+    - mAP
+    - NDS
+    - mATE
+    - mASE
+    - mAOE
+    - mAVE
+    - mAAE
+
+  # NMS configuration for post-processing
+  nms:
+    enabled: true
+    # Score threshold to filter low-confidence detections
+    score_threshold: 0.1
+    # Maximum number of detections per frame
+    max_per_frame: 300

@@ -1,0 +1,172 @@
+# Cylinder3D Configuration for nuScenes Dataset
+# Reference: "Cylindrical and Asymmetrical 3D Convolution Networks for LiDAR Segmentation"
+# Paper: https://arxiv.org/abs/2011.10033
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+model:
+  name: "Cylinder3D"
+  num_classes: 17  # 16 semantic classes + 1 unlabeled
+  input_dims: 9    # x, y, z, intensity, r, theta, z_cyl, x_norm, y_norm
+  ignore_label: 0
+
+# ==============================================================================
+# Cylindrical Partition
+# ==============================================================================
+cylindrical_partition:
+  grid_size: [480, 360, 32]  # [rho, theta, z]
+  bounds:
+    rho: [0, 70]             # larger radial range for nuScenes
+    theta: [-3.14159265, 3.14159265]  # full 360 degrees
+    z: [-5, 3]               # wider height range for nuScenes
+
+# ==============================================================================
+# Backbone Configuration
+# ==============================================================================
+backbone:
+  type: "asymmetrical_3d_spconv"
+  init_channels: 32
+  encoder:
+    channels: [64, 128, 256, 256]
+    layers: [2, 2, 2, 2]
+    stride: [1, 2, 2, 2]
+  decoder:
+    channels: [256, 128, 64, 32]
+    layers: [2, 2, 2, 2]
+  dropout: 0.3
+  use_attention: true
+
+# Point-wise head
+point_head:
+  channels: [64, 32]
+  dropout: 0.1
+
+# ==============================================================================
+# Training Configuration
+# ==============================================================================
+training:
+  batch_size: 2
+  epochs: 40
+  optimizer:
+    type: "adam"
+    lr: 0.001
+    weight_decay: 0.0001
+    betas: [0.9, 0.99]
+  scheduler:
+    type: "cosine_annealing"
+    T_max: 40
+    eta_min: 0.00001
+  grad_clip: 10.0
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: true
+
+# ==============================================================================
+# Loss Configuration
+# ==============================================================================
+loss:
+  ce_weight: 1.0
+  lovasz_weight: 1.0
+  # Class weights for nuScenes (17 classes)
+  # 0: noise/unlabeled, 1: barrier, 2: bicycle, 3: bus, 4: car,
+  # 5: construction_vehicle, 6: motorcycle, 7: pedestrian, 8: traffic_cone,
+  # 9: trailer, 10: truck, 11: driveable_surface, 12: other_flat,
+  # 13: sidewalk, 14: terrain, 15: manmade, 16: vegetation
+  class_weights:
+    - 0.0     # noise/unlabeled (ignored)
+    - 4.605   # barrier
+    - 6.908   # bicycle
+    - 5.298   # bus
+    - 2.079   # car
+    - 5.991   # construction_vehicle
+    - 6.215   # motorcycle
+    - 5.298   # pedestrian
+    - 5.991   # traffic_cone
+    - 4.605   # trailer
+    - 3.219   # truck
+    - 1.099   # driveable_surface
+    - 3.912   # other_flat
+    - 2.303   # sidewalk
+    - 2.079   # terrain
+    - 1.609   # manmade
+    - 1.386   # vegetation
+
+# ==============================================================================
+# Data Augmentation
+# ==============================================================================
+augmentation:
+  rotation:
+    enabled: true
+    range: [-3.14159265, 3.14159265]  # full rotation around z-axis
+  flip:
+    enabled: true
+    axes: ["x", "y"]
+    probability: 0.5
+  scale:
+    enabled: true
+    range: [0.95, 1.05]
+  translate:
+    enabled: true
+    range: [0.1, 0.1, 0.1]  # [x, y, z] in meters
+  random_drop:
+    enabled: true
+    max_ratio: 0.1
+  jitter:
+    enabled: false
+    sigma: 0.01
+    clip: 0.05
+
+# ==============================================================================
+# Dataset Configuration
+# ==============================================================================
+dataset:
+  name: "nuScenes"
+  root_dir: "/data/nuscenes"
+  version: "v1.0-trainval"
+  label_mapping: "configs/label_mapping/nuscenes.yaml"
+  split:
+    train: "train"
+    val: "val"
+    test: "test"
+  num_points: -1  # use all points
+  use_lidarseg: true
+  return_ref: true  # return intensity
+
+# ==============================================================================
+# Evaluation Configuration
+# ==============================================================================
+evaluation:
+  metrics: ["miou", "iou_per_class", "accuracy", "fwiou"]
+  eval_frequency: 1  # evaluate every N epochs
+  save_best: true
+  best_metric: "miou"
+  test_time_augmentation:
+    enabled: false
+    rotations: [0, 1.5708, 3.14159, 4.71239]  # 0, 90, 180, 270 degrees
+    flips: [false, true]
+
+# ==============================================================================
+# Checkpoint and Logging
+# ==============================================================================
+checkpoint:
+  save_dir: "checkpoints/cylinder3d_nuscenes"
+  save_frequency: 5  # save every N epochs
+  resume: null  # path to resume checkpoint
+
+logging:
+  log_dir: "logs/cylinder3d_nuscenes"
+  log_frequency: 10  # log every N iterations
+  use_tensorboard: true
+  use_wandb: false
+  wandb_project: "cylinder3d"
+  wandb_entity: null
+
+# ==============================================================================
+# Inference Configuration
+# ==============================================================================
+inference:
+  checkpoint: "checkpoints/cylinder3d_nuscenes/best_model.pth"
+  output_dir: "predictions/nuscenes"
+  save_predictions: true
+  visualization: false

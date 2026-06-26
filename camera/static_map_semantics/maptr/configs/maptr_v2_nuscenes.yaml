@@ -1,0 +1,479 @@
+# =============================================================================
+# MapTRv2: An End-to-End Framework for Online Vectorized HD Map Construction
+# Configuration: ResNet-50 backbone on nuScenes with auxiliary losses
+# Paper: https://arxiv.org/abs/2308.05736
+# =============================================================================
+# Key improvements over MapTR v1:
+#   1. Auxiliary one-to-many matching for accelerated convergence
+#   2. Decoupled self-attention (instance-level + point-level separate)
+#   3. Dense BEV segmentation supervision
+#   4. Depth supervision for GKT view transformation
+#   5. Extended 110-epoch training schedule for auxiliary loss convergence
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  type: "MapTRv2"
+
+  # Backbone: ResNet-50 with Feature Pyramid Network (same as v1)
+  backbone:
+    type: "ResNet"
+    depth: 50
+    num_stages: 4
+    out_indices: [1, 2, 3]  # C3, C4, C5 features
+    frozen_stages: 1
+    norm_cfg:
+      type: "BN2d"
+      requires_grad: false
+    norm_eval: true
+    style: "pytorch"
+    pretrained: "torchvision://resnet50"
+
+  # Feature Pyramid Network for multi-scale feature fusion
+  neck:
+    type: "FPN"
+    in_channels: [512, 1024, 2048]
+    out_channels: 256
+    start_level: 0
+    add_extra_convs: "on_output"
+    num_outs: 3
+    relu_before_extra_convs: true
+
+  # BEV (Bird's Eye View) configuration
+  bev:
+    bev_h: 200  # BEV grid height (longitudinal)
+    bev_w: 100  # BEV grid width (lateral)
+    real_h: 60.0  # Real-world height coverage in meters
+    real_w: 30.0  # Real-world width coverage in meters
+    embed_dims: 256
+
+  # GKT (Geometry-guided Kernel Transformer) with depth supervision
+  gkt:
+    type: "GKT"
+    embed_dims: 256
+    num_heads: 8
+    kernel_size: 3
+    dilation: 1
+    num_levels: 3  # Multi-scale feature levels from FPN
+    bn_momentum: 0.1
+    bias: true
+    # Depth estimation for geometry-guided projection
+    depth_start: 1.0
+    depth_end: 60.0
+    depth_step: 0.5
+    # [v2] Depth supervision from LiDAR-projected depth maps
+    depth_supervision:
+      enabled: true
+      depth_channels: 118  # Number of discrete depth bins (60-1)/0.5
+      depth_loss_type: "BinaryCrossEntropy"
+      depth_loss_weight: 3.0
+      # Min/max depth for ground truth generation
+      gt_depth_range: [1.0, 60.0]
+      # Use LiDAR points projected onto camera planes as supervision
+      lidar_depth_gt: true
+
+  # MapTRv2 Decoder Head
+  head:
+    type: "MapTRv2Head"
+    num_classes: 3  # ped_crossing, divider, boundary
+    num_queries: 50  # Number of map element instances (one-to-one group)
+    num_points_per_instance: 20  # Polyline points per instance
+    embed_dims: 256
+    coord_dim: 2  # 2D BEV coordinates (x, y)
+
+    # [v2] Auxiliary one-to-many matching configuration
+    # Additional query groups that share decoder weights but use relaxed matching
+    one2many_cfg:
+      enabled: true
+      num_one2many_groups: 6  # Number of auxiliary query groups
+      one2many_loss_weight: 1.0  # Weight for auxiliary matching loss
+      # Each group has the same num_queries but matches independently
+      # This provides more gradient signal per decoder layer
+      k_one2many: 6  # Top-k proposals per GT for one-to-many assignment
+      lambda_one2many: 1.0  # Loss scaling for one2many groups
+
+    # [v2] Decoupled self-attention: separate instance and point interactions
+    decoupled_attention:
+      enabled: true
+      # Instance-level self-attention: interaction among map element instances
+      instance_self_attn:
+        type: "MultiheadAttention"
+        embed_dims: 256
+        num_heads: 8
+        dropout: 0.1
+        # Operates on instance-level tokens (50 queries)
+      # Point-level self-attention: interaction among points within each instance
+      point_self_attn:
+        type: "MultiheadAttention"
+        embed_dims: 256
+        num_heads: 8
+        dropout: 0.1
+        # Operates on point-level tokens (20 points per instance)
+        # Captures local geometric structure of polylines
+
+    # Transformer decoder configuration
+    transformer:
+      type: "MapTRv2TransformerDecoder"
+      num_layers: 6
+      return_intermediate: true
+      transformerlayers:
+        type: "MapTRv2DecoderLayer"
+        attn_cfgs:
+          # [v2] Decoupled self-attention replaces standard self-attn
+          - type: "DecoupledSelfAttention"
+            embed_dims: 256
+            num_heads: 8
+            dropout: 0.1
+            num_instances: 50
+            num_points: 20
+          # Cross-attention with BEV features
+          - type: "MapTRCrossAttention"
+            embed_dims: 256
+            num_heads: 8
+            dropout: 0.1
+        ffn_cfgs:
+          type: "FFN"
+          embed_dims: 256
+          feedforward_channels: 512
+          num_fcs: 2
+          ffn_drop: 0.1
+          act_cfg:
+            type: "ReLU"
+            inplace: true
+        operation_order:
+          - "instance_self_attn"  # Instance-level interaction
+          - "norm"
+          - "point_self_attn"    # Point-level interaction
+          - "norm"
+          - "cross_attn"         # BEV feature aggregation
+          - "norm"
+          - "ffn"
+          - "norm"
+
+    # Positional encoding for queries
+    positional_encoding:
+      type: "SinePositionalEncoding"
+      num_feats: 128
+      normalize: true
+
+    # Instance query initialization
+    query_embedding:
+      type: "LearnedPositionalEncoding"
+      num_queries: 50
+      embed_dims: 256
+
+    # Point query initialization
+    point_embedding:
+      type: "LearnedPositionalEncoding"
+      num_points: 20
+      embed_dims: 256
+
+  # [v2] Dense BEV segmentation head for auxiliary supervision
+  bev_seg_head:
+    enabled: true
+    type: "BEVSegmentationHead"
+    in_channels: 256
+    # Predicts per-class semantic segmentation on BEV grid
+    num_classes: 3  # Same as map classes
+    # Architecture: lightweight CNN on BEV features
+    conv_layers:
+      - channels: 128
+        kernel_size: 3
+        padding: 1
+        stride: 1
+      - channels: 128
+        kernel_size: 3
+        padding: 1
+        stride: 1
+      - channels: 3  # Output: per-class logits
+        kernel_size: 1
+        padding: 0
+        stride: 1
+    # BEV segmentation loss
+    loss:
+      type: "CrossEntropyLoss"
+      use_sigmoid: true
+      loss_weight: 2.0
+    # Generate GT by rasterizing vectorized map onto BEV grid
+    gt_generation:
+      line_width: 2  # Pixels width for rasterized GT lines
+      bev_h: 200
+      bev_w: 100
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Hungarian matching cost weights (for bipartite matching)
+  matcher:
+    type: "HungarianMatcher"
+    cost_class: 2.0
+    cost_pts: 5.0
+    cost_dir: 0.005
+
+  # Classification loss
+  cls_loss:
+    type: "FocalLoss"
+    use_sigmoid: true
+    gamma: 2.0
+    alpha: 0.25
+    loss_weight: 2.0
+
+  # Point regression loss (L1 on normalized coordinates)
+  pts_loss:
+    type: "SmoothL1Loss"
+    beta: 1.0
+    loss_weight: 5.0
+
+  # Direction loss (cosine similarity of edge vectors)
+  dir_loss:
+    type: "PtsDirCosLoss"
+    loss_weight: 0.005
+
+  # Edge direction loss for polyline continuity
+  edge_loss:
+    type: "SmoothL1Loss"
+    beta: 1.0
+    loss_weight: 0.005
+
+  # [v2] Auxiliary one-to-many loss (applied to extra query groups)
+  one2many_loss:
+    # Same loss types as primary, weighted by lambda_one2many
+    cls_weight: 2.0
+    pts_weight: 5.0
+    dir_weight: 0.005
+    total_weight: 1.0  # Overall scaling of one2many losses
+
+  # [v2] Dense BEV segmentation loss
+  bev_seg_loss:
+    type: "CrossEntropyLoss"
+    use_sigmoid: true
+    loss_weight: 2.0
+
+  # [v2] Depth supervision loss for GKT
+  depth_loss:
+    type: "BinaryCrossEntropy"
+    loss_weight: 3.0
+
+# -----------------------------------------------------------------------------
+# Dataset Configuration
+# -----------------------------------------------------------------------------
+dataset:
+  type: "nuScenes"
+  version: "v1.0-trainval"
+  data_root: "data/nuscenes/"
+
+  # Camera setup: 6 surround-view cameras
+  cameras:
+    - "CAM_FRONT"
+    - "CAM_FRONT_RIGHT"
+    - "CAM_FRONT_LEFT"
+    - "CAM_BACK"
+    - "CAM_BACK_LEFT"
+    - "CAM_BACK_RIGHT"
+
+  # Map element classes
+  map_classes:
+    - "ped_crossing"   # Pedestrian crossings
+    - "divider"        # Lane dividers (road boundaries, lane lines)
+    - "boundary"       # Road boundaries
+
+  # Perception range in meters [x_min, y_min, z_min, x_max, y_max, z_max]
+  point_cloud_range: [-30.0, -15.0, -5.0, 30.0, 15.0, 3.0]
+
+  # Fixed number of points to sample per polyline instance
+  fixed_num_pts_per_line: 20
+
+  # Padding value for lines with fewer vertices
+  padding_value: -10000
+
+  # [v2] Additional data for auxiliary supervision
+  aux_data:
+    # LiDAR point cloud for depth GT generation
+    load_lidar: true
+    lidar_key: "LIDAR_TOP"
+    # Rasterized BEV map for segmentation GT
+    generate_bev_seg_gt: true
+
+  # Evaluation settings
+  eval_cfg:
+    # Chamfer distance thresholds for AP computation (in meters)
+    thresholds: [0.5, 1.0, 1.5]
+
+# -----------------------------------------------------------------------------
+# Data Pipeline
+# -----------------------------------------------------------------------------
+data_pipeline:
+  # Input image preprocessing
+  img_size: [480, 800]  # [H, W] after resize
+  img_norm_cfg:
+    mean: [103.530, 116.280, 123.675]  # BGR mean (ImageNet)
+    std: [1.0, 1.0, 1.0]
+    to_rgb: false
+
+  # Training augmentation
+  train_transforms:
+    - type: "PhotoMetricDistortion"
+      brightness_delta: 32
+      contrast_range: [0.5, 1.5]
+      saturation_range: [0.5, 1.5]
+      hue_delta: 18
+    - type: "RandomResize"
+      img_scale: [480, 800]
+      keep_ratio: true
+    - type: "GridMask"
+      use_h: true
+      use_w: true
+      max_epoch: 110  # [v2] Extended to match longer schedule
+      rotate: 1
+      offset: false
+      ratio: 0.5
+      mode: 1
+      prob: 0.7
+    - type: "Normalize"
+      img_norm_cfg: "${data_pipeline.img_norm_cfg}"
+    - type: "Pad"
+      size_divisor: 32
+
+  # Validation/test transforms (no augmentation)
+  val_transforms:
+    - type: "Resize"
+      img_scale: [480, 800]
+      keep_ratio: true
+    - type: "Normalize"
+      img_norm_cfg: "${data_pipeline.img_norm_cfg}"
+    - type: "Pad"
+      size_divisor: 32
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Optimizer
+  optimizer:
+    type: "AdamW"
+    lr: 6.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    # Per-parameter learning rate adjustments
+    paramwise_cfg:
+      custom_keys:
+        backbone:
+          lr_mult: 0.1  # Lower LR for pretrained backbone
+        bev_seg_head:
+          lr_mult: 1.0  # Full LR for auxiliary BEV seg head
+        gkt.depth_net:
+          lr_mult: 1.0  # Full LR for depth prediction network
+
+  # Learning rate scheduler
+  lr_scheduler:
+    type: "CosineAnnealingLR"
+    # [v2] Extended schedule for convergence with auxiliary losses
+    T_max: 110  # Total epochs (vs 24 in v1)
+    eta_min: 6.0e-6  # Minimum learning rate
+    warmup:
+      type: "linear"
+      warmup_iters: 500
+      warmup_ratio: 0.001  # Start from 0.1% of base LR
+
+  # [v2] Training schedule: 110 epochs for full convergence
+  # The one-to-many matching and auxiliary losses require more epochs
+  # to fully leverage the additional supervision signal
+  epochs: 110
+  batch_size: 4  # Per GPU
+  num_workers: 4  # Dataloader workers per GPU
+
+  # Gradient clipping
+  grad_clip:
+    max_norm: 35.0
+    norm_type: 2
+
+  # Mixed precision training
+  fp16:
+    enabled: true
+    loss_scale: 512.0
+
+  # [v2] Auxiliary loss scheduling
+  # Gradually activate auxiliary losses for stable training
+  aux_loss_schedule:
+    # One-to-many matching active from the start
+    one2many_start_epoch: 0
+    # BEV segmentation warmup (start with lower weight)
+    bev_seg_warmup_epochs: 5
+    bev_seg_warmup_factor: 0.1  # Ramp from 10% to 100% over warmup
+    # Depth supervision active from the start
+    depth_start_epoch: 0
+
+  # Checkpoint and logging
+  checkpoint_interval: 5  # Save every N epochs (more epochs = less frequent saves)
+  log_interval: 50  # Log every N iterations
+  eval_interval: 10  # Evaluate every N epochs
+
+  # Distributed training
+  dist_cfg:
+    backend: "nccl"
+    find_unused_parameters: true
+
+  # Random seed for reproducibility
+  seed: 0
+  deterministic: false
+
+# -----------------------------------------------------------------------------
+# Runtime Configuration
+# -----------------------------------------------------------------------------
+runtime:
+  # GPU configuration
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]  # 8 GPUs recommended for v2 (longer schedule)
+
+  # Paths
+  work_dir: "work_dirs/maptr_v2_r50_nuscenes_110ep"
+  resume_from: null
+  load_from: null  # Path to pretrained weights (e.g., FCOS3D init or v1 checkpoint)
+
+  # Logging backends
+  logger:
+    type: "TensorBoard"
+    log_dir: "${runtime.work_dir}/tf_logs"
+
+  # Wandb integration (optional)
+  wandb:
+    enabled: false
+    project: "maptr_v2"
+    name: "r50_nuscenes_110ep"
+
+# -----------------------------------------------------------------------------
+# MapTRv2 Feature Summary
+# -----------------------------------------------------------------------------
+# Compared to MapTR v1 (maptr_r50_nuscenes.yaml), this config adds:
+#
+# 1. ONE-TO-MANY MATCHING (one2many_cfg):
+#    - 6 auxiliary query groups sharing decoder weights
+#    - Each group performs independent Hungarian matching
+#    - Provides 6x more positive training signal per iteration
+#    - Critical for faster convergence and better final performance
+#
+# 2. DECOUPLED SELF-ATTENTION (decoupled_attention):
+#    - Instance-level: captures global layout relationships between map elements
+#    - Point-level: captures local geometry within each polyline
+#    - Replaces single monolithic self-attention over all query tokens
+#    - Reduces attention complexity from O((N*P)^2) to O(N^2 + N*P^2)
+#
+# 3. DENSE BEV SUPERVISION (bev_seg_head):
+#    - Auxiliary segmentation head on BEV features
+#    - Guides BEV feature learning with dense pixel-level signal
+#    - GT generated by rasterizing vectorized map annotations
+#    - Complements sparse query-based supervision
+#
+# 4. DEPTH SUPERVISION (gkt.depth_supervision):
+#    - Explicit depth prediction loss in GKT module
+#    - LiDAR points projected to camera planes as GT
+#    - Improves accuracy of 2D-to-BEV view transformation
+#    - Binary cross-entropy over discretized depth bins
+#
+# 5. EXTENDED SCHEDULE (110 epochs vs 24):
+#    - More epochs needed for auxiliary losses to fully converge
+#    - One-to-many matching benefits from longer training
+#    - Cosine annealing over full 110-epoch span
+# =============================================================================

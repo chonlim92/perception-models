@@ -1,0 +1,335 @@
+# PointNet++ 3D Object Detection Configuration
+# Task: 3D object detection from LiDAR point clouds (KITTI benchmark)
+# Architecture: PointNet++ backbone + anchor-free detection head (PointRCNN-style)
+
+# =============================================================================
+# Model Parameters
+# =============================================================================
+model:
+  name: pointnet_pp_det_kitti
+  type: detection
+  num_classes: 3  # Car, Pedestrian, Cyclist
+
+  # Input point cloud
+  npoints: 16384
+  input_channels: 4  # x, y, z, reflectance
+
+  # Backbone: Set Abstraction layers (SSG for outdoor detection)
+  backbone:
+    sa_layers:
+      - name: sa1
+        npoint: 4096
+        radius: 0.2
+        nsample: 64
+        mlp: [64, 64, 128]
+        bn: true
+        activation: relu
+        # Receptive field: ~0.4m (individual surface patches)
+
+      - name: sa2
+        npoint: 1024
+        radius: 0.8
+        nsample: 64
+        mlp: [128, 128, 256]
+        bn: true
+        activation: relu
+        # Receptive field: ~1.6m (object parts)
+
+      - name: sa3
+        npoint: 256
+        radius: 2.0
+        nsample: 64
+        mlp: [256, 256, 512]
+        bn: true
+        activation: relu
+        # Receptive field: ~5.6m (full objects, e.g., entire car)
+
+      - name: sa4
+        npoint: 64
+        radius: 4.0
+        nsample: 64
+        mlp: [512, 512, 1024]
+        bn: true
+        activation: relu
+        # Receptive field: ~13.6m (scene context)
+
+  # Decoder: Feature Propagation layers
+  decoder:
+    fp_layers:
+      - name: fp4
+        # Interpolate: 64 → 256 points + skip from SA3
+        mlp: [512, 512]
+        bn: true
+        activation: relu
+
+      - name: fp3
+        # Interpolate: 256 → 1024 points + skip from SA2
+        mlp: [256, 256]
+        bn: true
+        activation: relu
+
+    # Detection operates on 1024 keypoints from FP3 output
+    keypoint_features_dim: 256
+
+  # Detection head (Stage 1: proposal generation)
+  detection_head:
+    type: anchor_free  # Center-based, no predefined anchors
+
+    # Foreground/background segmentation
+    fg_seg:
+      mlp: [256, 128]
+      bn: true
+
+    # Box regression from foreground points
+    box_regression:
+      mlp: [256, 128, 64]
+      bn: true
+      output_dim: 7  # Δx, Δy, Δz, log(w), log(h), log(l), θ
+      heading_bin_num: 12  # Discretize heading into 12 bins + residual
+
+    # Confidence prediction
+    confidence:
+      mlp: [128, 64]
+      output_dim: 1
+
+  # Stage 2: Proposal refinement (optional)
+  refinement:
+    enabled: true
+    points_per_proposal: 512
+    enlarge_ratio: 1.3  # Enlarge proposal box for context
+    canonical_transform: true  # Transform to proposal-local coordinates
+
+    mlp: [256, 256, 128]
+    fc_layers:
+      - out_features: 256
+        dropout: 0.3
+      - out_features: 128
+        dropout: 0.3
+
+    # Refined output
+    cls_output: 3  # num_classes confidence
+    reg_output: 7  # Δx, Δy, Δz, Δw, Δh, Δl, Δθ
+
+# =============================================================================
+# Detection Parameters
+# =============================================================================
+detection:
+  # Point cloud range (meters, LiDAR frame)
+  point_cloud_range:
+    x: [0.0, 70.4]      # Forward
+    y: [-40.0, 40.0]     # Lateral
+    z: [-3.0, 1.0]       # Vertical
+
+  # Class-specific anchor sizes (for anchor-based variant)
+  anchor_sizes:
+    car:
+      width: 1.6
+      height: 1.56
+      length: 3.9
+    pedestrian:
+      width: 0.6
+      height: 1.73
+      length: 0.8
+    cyclist:
+      width: 0.6
+      height: 1.73
+      length: 1.76
+
+  # NMS configuration
+  nms:
+    train:
+      score_threshold: 0.1
+      iou_threshold: 0.8
+      max_proposals: 512
+    test:
+      score_threshold: 0.1
+      iou_threshold: 0.7
+      max_proposals: 100
+
+  # Per-class NMS (applied separately per class)
+  per_class_nms:
+    car:
+      iou_threshold: 0.7
+      max_detections: 50
+    pedestrian:
+      iou_threshold: 0.5
+      max_detections: 30
+    cyclist:
+      iou_threshold: 0.5
+      max_detections: 30
+
+  # IoU thresholds for matching predictions to GT during training
+  target_assignment:
+    pos_iou_threshold: 0.6
+    neg_iou_threshold: 0.45
+    sample_strategy: all_foreground  # Or balanced (1:1 pos:neg ratio)
+
+# =============================================================================
+# Training Parameters
+# =============================================================================
+training:
+  epochs: 80
+  batch_size: 4  # Per GPU (point clouds are large)
+  num_workers: 4
+  pin_memory: true
+
+  # Optimizer
+  optimizer:
+    type: adamw
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+
+  # Learning rate schedule
+  scheduler:
+    type: one_cycle
+    max_lr: 0.01
+    pct_start: 0.4         # 40% warmup
+    anneal_strategy: cos
+    div_factor: 10         # Initial LR = max_lr / 10 = 0.001
+    final_div_factor: 100  # Final LR = max_lr / 1000 = 0.00001
+
+  # Loss function weights
+  loss:
+    # Stage 1
+    cls_weight: 1.0            # Foreground segmentation loss
+    reg_weight: 2.0            # Box regression loss (Smooth L1)
+    dir_weight: 0.2            # Heading direction classification
+
+    # Stage 2 (if refinement enabled)
+    refine_cls_weight: 1.0
+    refine_reg_weight: 1.0
+
+    # Loss types
+    cls_loss_type: focal        # Focal loss for class imbalance
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    reg_loss_type: smooth_l1
+    smooth_l1_beta: 0.1111     # 1/9
+
+  # Gradient clipping
+  grad_clip:
+    max_norm: 10.0
+
+  # Mixed precision
+  amp:
+    enabled: true
+
+  # Checkpointing
+  checkpoint:
+    save_interval: 5
+    save_best: true
+    metric: car_3d_ap_moderate
+    mode: max
+
+# =============================================================================
+# Data Parameters
+# =============================================================================
+data:
+  dataset: kitti
+  root_dir: ./data/kitti
+  split:
+    train: train  # 3712 samples (Chen split)
+    val: val      # 3769 samples
+    test: test    # 7518 samples
+
+  # Preprocessing
+  preprocessing:
+    npoints: 16384
+    remove_ground: false  # Let the model learn to ignore ground
+    filter_by_range: true
+    filter_by_fov: true   # Only keep points in camera FOV
+
+  # Ground truth augmentation database
+  gt_augmentation:
+    enabled: true
+    db_info_path: ./data/kitti/kitti_dbinfos_train.pkl
+    max_samples_per_class:
+      car: 15
+      pedestrian: 10
+      cyclist: 10
+    min_points_per_sample:
+      car: 5
+      pedestrian: 5
+      cyclist: 5
+    remove_difficulty: [-1]  # Remove DontCare during DB creation
+
+  # Data augmentation
+  augmentation:
+    random_rotation_z:
+      enabled: true
+      angle_range: [-0.7854, 0.7854]  # ±π/4 (±45°)
+
+    random_flip_x:
+      enabled: true
+      probability: 0.5
+
+    random_flip_y:
+      enabled: false  # Usually not used for KITTI (front-facing)
+
+    random_scaling:
+      enabled: true
+      scale_range: [0.95, 1.05]
+
+    point_jitter:
+      enabled: true
+      sigma: 0.01
+      clip: 0.05
+
+    random_world_translation:
+      enabled: true
+      std: [0.2, 0.2, 0.2]  # meters
+
+# =============================================================================
+# Evaluation Parameters
+# =============================================================================
+evaluation:
+  batch_size: 1  # Process one scene at a time
+
+  # KITTI evaluation protocol
+  protocol: kitti_40_point  # 40-point AP interpolation
+
+  # Evaluation IoU thresholds
+  iou_thresholds:
+    car: 0.7
+    pedestrian: 0.5
+    cyclist: 0.5
+
+  # Difficulty levels to evaluate
+  difficulties: [easy, moderate, hard]
+
+  # Metrics
+  metrics:
+    - 3d_ap         # 3D Average Precision
+    - bev_ap        # Bird's Eye View AP
+    - aos           # Average Orientation Similarity
+
+  # Score thresholds for submission
+  score_thresholds:
+    car: 0.3
+    pedestrian: 0.2
+    cyclist: 0.2
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  log_dir: ./logs/pointnet_pp_det
+  log_interval: 50
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: pointnet_pp_detection
+    entity: null
+
+# =============================================================================
+# Hardware
+# =============================================================================
+hardware:
+  gpus: [0, 1, 2, 3]
+  distributed: true
+  backend: nccl
+  sync_bn: true
+  seed: 42
+  deterministic: false

@@ -1,0 +1,310 @@
+# =============================================================================
+# MapTR: Structured Modeling and Learning for Online Vectorized HD Map Construction
+# Configuration: ResNet-50 backbone on nuScenes dataset
+# Paper: https://arxiv.org/abs/2208.14437
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  type: "MapTR"
+
+  # Backbone: ResNet-50 with Feature Pyramid Network
+  backbone:
+    type: "ResNet"
+    depth: 50
+    num_stages: 4
+    out_indices: [1, 2, 3]  # C3, C4, C5 features
+    frozen_stages: 1
+    norm_cfg:
+      type: "BN2d"
+      requires_grad: false
+    norm_eval: true
+    style: "pytorch"
+    pretrained: "torchvision://resnet50"
+
+  # Feature Pyramid Network for multi-scale feature fusion
+  neck:
+    type: "FPN"
+    in_channels: [512, 1024, 2048]
+    out_channels: 256
+    start_level: 0
+    add_extra_convs: "on_output"
+    num_outs: 3
+    relu_before_extra_convs: true
+
+  # BEV (Bird's Eye View) configuration
+  bev:
+    bev_h: 200  # BEV grid height (longitudinal)
+    bev_w: 100  # BEV grid width (lateral)
+    real_h: 60.0  # Real-world height coverage in meters
+    real_w: 30.0  # Real-world width coverage in meters
+    embed_dims: 256
+
+  # GKT (Geometry-guided Kernel Transformer) for view transformation
+  gkt:
+    type: "GKT"
+    embed_dims: 256
+    num_heads: 8
+    kernel_size: 3
+    dilation: 1
+    num_levels: 3  # Multi-scale feature levels from FPN
+    bn_momentum: 0.1
+    bias: true
+    # Depth estimation for geometry-guided projection
+    depth_start: 1.0
+    depth_end: 60.0
+    depth_step: 0.5
+
+  # MapTR Decoder Head
+  head:
+    type: "MapTRHead"
+    num_classes: 3  # ped_crossing, divider, boundary
+    num_queries: 50  # Number of map element instances
+    num_points_per_instance: 20  # Polyline points per instance
+    embed_dims: 256
+    coord_dim: 2  # 2D BEV coordinates (x, y)
+
+    # Transformer decoder configuration
+    transformer:
+      type: "MapTRTransformerDecoder"
+      num_layers: 6
+      return_intermediate: true
+      transformerlayers:
+        type: "DetrTransformerDecoderLayer"
+        attn_cfgs:
+          # Self-attention among queries
+          - type: "MultiheadAttention"
+            embed_dims: 256
+            num_heads: 8
+            dropout: 0.1
+          # Cross-attention with BEV features
+          - type: "MapTRCrossAttention"
+            embed_dims: 256
+            num_heads: 8
+            dropout: 0.1
+        ffn_cfgs:
+          type: "FFN"
+          embed_dims: 256
+          feedforward_channels: 512
+          num_fcs: 2
+          ffn_drop: 0.1
+          act_cfg:
+            type: "ReLU"
+            inplace: true
+        operation_order: ["self_attn", "norm", "cross_attn", "norm", "ffn", "norm"]
+
+    # Positional encoding for queries
+    positional_encoding:
+      type: "SinePositionalEncoding"
+      num_feats: 128
+      normalize: true
+
+    # Instance query initialization
+    query_embedding:
+      type: "LearnedPositionalEncoding"
+      num_queries: 50
+      embed_dims: 256
+
+    # Point query initialization
+    point_embedding:
+      type: "LearnedPositionalEncoding"
+      num_points: 20
+      embed_dims: 256
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Hungarian matching cost weights (for bipartite matching)
+  matcher:
+    type: "HungarianMatcher"
+    cost_class: 2.0
+    cost_pts: 5.0
+    cost_dir: 0.005
+
+  # Classification loss
+  cls_loss:
+    type: "FocalLoss"
+    use_sigmoid: true
+    gamma: 2.0
+    alpha: 0.25
+    loss_weight: 2.0
+
+  # Point regression loss (L1 on normalized coordinates)
+  pts_loss:
+    type: "SmoothL1Loss"
+    beta: 1.0
+    loss_weight: 5.0
+
+  # Direction loss (cosine similarity of edge vectors)
+  dir_loss:
+    type: "PtsDirCosLoss"
+    loss_weight: 0.005
+
+  # Edge direction loss for polyline continuity
+  edge_loss:
+    type: "SmoothL1Loss"
+    beta: 1.0
+    loss_weight: 0.005
+
+# -----------------------------------------------------------------------------
+# Dataset Configuration
+# -----------------------------------------------------------------------------
+dataset:
+  type: "nuScenes"
+  version: "v1.0-trainval"
+  data_root: "data/nuscenes/"
+
+  # Camera setup: 6 surround-view cameras
+  cameras:
+    - "CAM_FRONT"
+    - "CAM_FRONT_RIGHT"
+    - "CAM_FRONT_LEFT"
+    - "CAM_BACK"
+    - "CAM_BACK_LEFT"
+    - "CAM_BACK_RIGHT"
+
+  # Map element classes
+  map_classes:
+    - "ped_crossing"   # Pedestrian crossings
+    - "divider"        # Lane dividers (road boundaries, lane lines)
+    - "boundary"       # Road boundaries
+
+  # Perception range in meters [x_min, y_min, z_min, x_max, y_max, z_max]
+  point_cloud_range: [-30.0, -15.0, -5.0, 30.0, 15.0, 3.0]
+
+  # Fixed number of points to sample per polyline instance
+  fixed_num_pts_per_line: 20
+
+  # Padding value for lines with fewer vertices
+  padding_value: -10000
+
+  # Evaluation settings
+  eval_cfg:
+    # Chamfer distance thresholds for AP computation (in meters)
+    thresholds: [0.5, 1.0, 1.5]
+
+# -----------------------------------------------------------------------------
+# Data Pipeline
+# -----------------------------------------------------------------------------
+data_pipeline:
+  # Input image preprocessing
+  img_size: [480, 800]  # [H, W] after resize
+  img_norm_cfg:
+    mean: [103.530, 116.280, 123.675]  # BGR mean (ImageNet)
+    std: [1.0, 1.0, 1.0]
+    to_rgb: false
+
+  # Training augmentation
+  train_transforms:
+    - type: "PhotoMetricDistortion"
+      brightness_delta: 32
+      contrast_range: [0.5, 1.5]
+      saturation_range: [0.5, 1.5]
+      hue_delta: 18
+    - type: "RandomResize"
+      img_scale: [480, 800]
+      keep_ratio: true
+    - type: "GridMask"
+      use_h: true
+      use_w: true
+      max_epoch: 24
+      rotate: 1
+      offset: false
+      ratio: 0.5
+      mode: 1
+      prob: 0.7
+    - type: "Normalize"
+      img_norm_cfg: "${data_pipeline.img_norm_cfg}"
+    - type: "Pad"
+      size_divisor: 32
+
+  # Validation/test transforms (no augmentation)
+  val_transforms:
+    - type: "Resize"
+      img_scale: [480, 800]
+      keep_ratio: true
+    - type: "Normalize"
+      img_norm_cfg: "${data_pipeline.img_norm_cfg}"
+    - type: "Pad"
+      size_divisor: 32
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Optimizer
+  optimizer:
+    type: "AdamW"
+    lr: 6.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    # Per-parameter learning rate adjustments
+    paramwise_cfg:
+      custom_keys:
+        backbone:
+          lr_mult: 0.1  # Lower LR for pretrained backbone
+
+  # Learning rate scheduler
+  lr_scheduler:
+    type: "CosineAnnealingLR"
+    T_max: 24  # Total epochs
+    eta_min: 6.0e-6  # Minimum learning rate (1/100 of base)
+    warmup:
+      type: "linear"
+      warmup_iters: 500
+      warmup_ratio: 0.001  # Start from 0.1% of base LR
+
+  # Training schedule
+  epochs: 24
+  batch_size: 4  # Per GPU
+  num_workers: 4  # Dataloader workers per GPU
+
+  # Gradient clipping
+  grad_clip:
+    max_norm: 35.0
+    norm_type: 2
+
+  # Mixed precision training
+  fp16:
+    enabled: true
+    loss_scale: 512.0
+
+  # Checkpoint and logging
+  checkpoint_interval: 1  # Save every N epochs
+  log_interval: 50  # Log every N iterations
+  eval_interval: 6  # Evaluate every N epochs
+
+  # Distributed training
+  dist_cfg:
+    backend: "nccl"
+    find_unused_parameters: true
+
+  # Random seed for reproducibility
+  seed: 0
+  deterministic: false
+
+# -----------------------------------------------------------------------------
+# Runtime Configuration
+# -----------------------------------------------------------------------------
+runtime:
+  # GPU configuration
+  gpu_ids: [0, 1, 2, 3]  # 4 GPUs default
+
+  # Paths
+  work_dir: "work_dirs/maptr_r50_nuscenes_24ep"
+  resume_from: null
+  load_from: null  # Path to pretrained weights (e.g., FCOS3D init)
+
+  # Logging backends
+  logger:
+    type: "TensorBoard"
+    log_dir: "${runtime.work_dir}/tf_logs"
+
+  # Wandb integration (optional)
+  wandb:
+    enabled: false
+    project: "maptr"
+    name: "r50_nuscenes_24ep"

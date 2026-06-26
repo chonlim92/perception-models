@@ -1,0 +1,347 @@
+# PointNet++ Semantic Segmentation Configuration
+# Task: Point-wise semantic segmentation on outdoor LiDAR scans (SemanticKITTI)
+# Architecture: PointNet++ encoder-decoder with MSG + skip connections
+
+# =============================================================================
+# Model Parameters
+# =============================================================================
+model:
+  name: pointnet_pp_seg_semantickitti
+  type: segmentation
+  num_seg_classes: 19  # SemanticKITTI evaluation classes
+  ignore_index: 0      # Unlabeled class (not evaluated)
+
+  # Input point cloud
+  npoints: 8192  # Points per sub-cloud (scene divided into spatial blocks)
+  input_channels: 4  # x, y, z, reflectance
+
+  # Encoder: Set Abstraction layers (MSG for density robustness)
+  encoder:
+    sa_layers:
+      - name: sa1
+        npoint: 2048
+        msg:
+          - radius: 0.1
+            nsample: 32
+            mlp: [32, 32, 64]
+          - radius: 0.2
+            nsample: 64
+            mlp: [64, 64, 128]
+        # Output: 2048 points, feature_dim = 64 + 128 = 192
+        bn: true
+        activation: relu
+
+      - name: sa2
+        npoint: 512
+        msg:
+          - radius: 0.2
+            nsample: 32
+            mlp: [64, 64, 128]
+          - radius: 0.4
+            nsample: 64
+            mlp: [128, 128, 256]
+        # Output: 512 points, feature_dim = 128 + 256 = 384
+        bn: true
+        activation: relu
+
+      - name: sa3
+        npoint: 128
+        msg:
+          - radius: 0.4
+            nsample: 32
+            mlp: [128, 128, 256]
+          - radius: 0.8
+            nsample: 64
+            mlp: [256, 256, 512]
+        # Output: 128 points, feature_dim = 256 + 512 = 768
+        bn: true
+        activation: relu
+
+      - name: sa4_global
+        npoint: null
+        group_all: true
+        mlp: [256, 512, 1024]
+        # Output: 1 point (global), feature_dim = 1024
+        bn: true
+        activation: relu
+
+  # Decoder: Feature Propagation layers (with skip connections)
+  decoder:
+    fp_layers:
+      - name: fp4
+        # Interpolate from 1 → 128 points
+        # Input: interpolated(1024) + skip_sa3(768) = 1792
+        input_dim: 1792
+        mlp: [512, 512]
+        bn: true
+        activation: relu
+
+      - name: fp3
+        # Interpolate from 128 → 512 points
+        # Input: interpolated(512) + skip_sa2(384) = 896
+        input_dim: 896
+        mlp: [256, 256]
+        bn: true
+        activation: relu
+
+      - name: fp2
+        # Interpolate from 512 → 2048 points
+        # Input: interpolated(256) + skip_sa1(192) = 448
+        input_dim: 448
+        mlp: [256, 128]
+        bn: true
+        activation: relu
+
+      - name: fp1
+        # Interpolate from 2048 → 8192 points (original resolution)
+        # Input: interpolated(128) + raw_input(4) = 132
+        input_dim: 132
+        mlp: [128, 128, 128]
+        bn: true
+        activation: relu
+
+    # Interpolation parameters
+    interpolation:
+      k_nearest: 3           # Use 3 nearest neighbors for interpolation
+      distance_power: 2      # Inverse distance weighting power (1/d^p)
+
+  # Segmentation head
+  seg_head:
+    layers:
+      - out_features: 128
+        batch_norm: true
+        activation: relu
+        dropout: 0.5
+      - out_features: 19  # num_seg_classes
+        batch_norm: false
+        activation: null
+        dropout: 0.0
+
+# =============================================================================
+# Class Definitions (SemanticKITTI)
+# =============================================================================
+classes:
+  names:
+    - car              # 0 (mapped from original label 10)
+    - bicycle          # 1 (mapped from 11)
+    - motorcycle       # 2 (mapped from 15)
+    - truck            # 3 (mapped from 18)
+    - other-vehicle    # 4 (mapped from 20)
+    - person           # 5 (mapped from 30)
+    - bicyclist        # 6 (mapped from 31)
+    - motorcyclist     # 7 (mapped from 32)
+    - road             # 8 (mapped from 40)
+    - parking          # 9 (mapped from 44)
+    - sidewalk         # 10 (mapped from 48)
+    - other-ground     # 11 (mapped from 49)
+    - building         # 12 (mapped from 50)
+    - fence            # 13 (mapped from 51)
+    - vegetation       # 14 (mapped from 70)
+    - trunk            # 15 (mapped from 71)
+    - terrain          # 16 (mapped from 72)
+    - pole             # 17 (mapped from 80)
+    - traffic-sign     # 18 (mapped from 81)
+
+  # Class weights (inverse log frequency from training set)
+  class_weights:
+    - 3.15   # car
+    - 8.74   # bicycle
+    - 7.82   # motorcycle
+    - 5.43   # truck
+    - 6.21   # other-vehicle
+    - 7.65   # person
+    - 8.93   # bicyclist
+    - 9.87   # motorcyclist
+    - 1.00   # road (most frequent)
+    - 3.28   # parking
+    - 1.45   # sidewalk
+    - 5.67   # other-ground
+    - 1.82   # building
+    - 3.95   # fence
+    - 1.23   # vegetation
+    - 4.56   # trunk
+    - 2.14   # terrain
+    - 5.12   # pole
+    - 6.78   # traffic-sign
+
+# =============================================================================
+# Training Parameters
+# =============================================================================
+training:
+  epochs: 100
+  batch_size: 8  # Per GPU
+  num_workers: 4
+  pin_memory: true
+
+  # Optimizer
+  optimizer:
+    type: adamw
+    lr: 0.002
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+
+  # Learning rate schedule
+  scheduler:
+    type: cosine_annealing
+    T_max: 100          # Total epochs
+    eta_min: 1.0e-5     # Minimum learning rate
+    warmup:
+      enabled: true
+      epochs: 5
+      start_lr: 1.0e-5  # Linearly warmup from this to base LR
+
+  # Loss function
+  loss:
+    type: weighted_cross_entropy
+    use_class_weights: true
+    label_smoothing: 0.0
+
+    # Optional: Lovász-Softmax loss (better IoU optimization)
+    lovasz:
+      enabled: true
+      weight: 0.5  # Combined: 0.5 * CE + 0.5 * Lovász
+
+  # Gradient clipping
+  grad_clip:
+    max_norm: 10.0
+
+  # Mixed precision
+  amp:
+    enabled: true
+
+  # Checkpointing
+  checkpoint:
+    save_interval: 5
+    save_best: true
+    metric: miou
+    mode: max
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.005
+
+# =============================================================================
+# Data Parameters
+# =============================================================================
+data:
+  dataset: semantic_kitti
+  root_dir: ./data/semantic_kitti/dataset/sequences
+
+  # SemanticKITTI sequence split
+  split:
+    train: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]  # Sequences for training
+    val: [8]                                    # Sequence 08 for validation
+    test: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]  # Hidden test set
+
+  # Point cloud preprocessing
+  preprocessing:
+    npoints: 8192
+    block_size: 10.0  # meters, divide scene into spatial blocks
+    block_stride: 5.0  # meters, overlap between blocks
+    padding: 0.5       # meters, padding around block edges
+
+    # Range filtering
+    point_cloud_range:
+      x: [-50.0, 50.0]
+      y: [-50.0, 50.0]
+      z: [-3.0, 3.0]
+
+    # Subsample if too many points
+    subsample_method: random  # 'random' or 'farthest_point'
+
+  # Data augmentation
+  augmentation:
+    random_rotation_z:
+      enabled: true
+      angle_range: [-3.141593, 3.141593]  # Full 360°
+
+    random_flip_x:
+      enabled: true
+      probability: 0.5
+
+    random_flip_y:
+      enabled: true
+      probability: 0.5
+
+    random_scaling:
+      enabled: true
+      scale_range: [0.95, 1.05]
+
+    point_jitter:
+      enabled: true
+      sigma: 0.02
+      clip: 0.1
+
+    random_drop:
+      enabled: true
+      max_ratio: 0.2  # Drop up to 20% of points
+
+    color_jitter:
+      enabled: false  # Only if using color features from camera
+
+    elastic_distortion:
+      enabled: true
+      granularity: 0.2
+      magnitude: 0.4
+
+    mix3d:
+      enabled: false  # Mix two scenes together (advanced augmentation)
+      probability: 0.25
+
+# =============================================================================
+# Evaluation Parameters
+# =============================================================================
+evaluation:
+  batch_size: 16
+
+  # Evaluation protocol
+  protocol: semantic_kitti  # Official SemanticKITTI evaluation
+
+  # Metrics
+  metrics:
+    - miou          # Mean Intersection over Union (primary metric)
+    - iou_per_class # Per-class IoU breakdown
+    - overall_accuracy
+    - frequency_weighted_iou
+
+  # Test-time augmentation (optional, for competition)
+  tta:
+    enabled: false
+    rotations: [0, 1.5708, 3.14159, 4.71239]  # 0°, 90°, 180°, 270°
+    flips: [false, true]  # With and without X-flip
+    scales: [0.95, 1.0, 1.05]
+
+  # Voting for block-based inference
+  voting:
+    enabled: true
+    num_votes: 5  # Run inference multiple times with different random sampling
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  log_dir: ./logs/pointnet_pp_seg
+  log_interval: 20
+  tensorboard: true
+  visualize:
+    enabled: true
+    interval: 500  # Visualize predictions every N batches
+    num_samples: 4
+  wandb:
+    enabled: false
+    project: pointnet_pp_segmentation
+    entity: null
+
+# =============================================================================
+# Hardware
+# =============================================================================
+hardware:
+  gpus: [0, 1, 2, 3]
+  distributed: true
+  backend: nccl
+  sync_bn: true  # Critical for small per-GPU batch sizes
+  seed: 42
+  deterministic: false

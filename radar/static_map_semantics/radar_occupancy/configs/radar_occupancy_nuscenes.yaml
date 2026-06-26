@@ -1,0 +1,115 @@
+# Radar Occupancy Grid Mapping — nuScenes Configuration
+
+# Dataset
+dataset:
+  name: nuscenes
+  version: v1.0-trainval
+  root: data/nuscenes
+  radar_sensors:
+    - RADAR_FRONT
+    - RADAR_FRONT_LEFT
+    - RADAR_FRONT_RIGHT
+    - RADAR_BACK_LEFT
+    - RADAR_BACK_RIGHT
+  num_sweeps: 6  # Accumulate 6 radar sweeps per sample
+  max_points_per_sweep: 300
+  min_rcs: -5.0  # Filter detections with RCS below this (dBsm)
+  remove_invalid: true
+  train_scenes: 700
+  val_scenes: 150
+
+# BEV Grid
+grid:
+  x_range: [-50.0, 50.0]
+  y_range: [-50.0, 50.0]
+  z_range: [-3.0, 5.0]
+  cell_size: 0.5  # meters per cell
+  grid_size: [200, 200]  # cells
+
+# Model
+model:
+  type: temporal_pillar_occ_net  # classical_ism | pillar_occ_net | temporal_pillar_occ_net
+
+  # Pillar encoding
+  pillar:
+    max_points_per_pillar: 20
+    max_pillars: 12000
+    input_features: 9  # x, y, z, rcs, vr, dt, x_center, y_center, z_center
+    pillar_features: 64
+
+  # Backbone (U-Net)
+  backbone:
+    encoder_channels: [64, 128, 256, 512]
+    decoder_channels: [256, 128, 64]
+    use_skip_connections: true
+    norm_type: batch_norm
+    activation: relu
+
+  # Temporal
+  temporal:
+    num_frames: 5  # Current + 4 past frames
+    fusion_method: concat_conv  # concat_conv | attention | gru
+    temporal_conv_channels: 64
+
+  # Output heads
+  heads:
+    occupancy:
+      num_classes: 1  # Binary occupancy
+      threshold: 0.5
+    semantics:
+      num_classes: 5  # free, vehicle, pedestrian, barrier, other
+      enabled: true
+
+# Classical ISM parameters (used when model.type = classical_ism)
+classical_ism:
+  free_log_odds: -0.847  # log(0.3/0.7)
+  occ_log_odds: 2.197    # log(0.9/0.1)
+  clamp_range: [-5.0, 5.0]
+  range_sigma: 0.3       # Range uncertainty (m)
+  angle_sigma: 1.5       # Angular uncertainty (degrees)
+  rcs_weight: true       # Weight update by RCS strength
+  num_accumulate: 20     # Number of frames to accumulate
+
+# Training
+training:
+  batch_size: 16
+  num_epochs: 50
+  optimizer:
+    type: adamw
+    lr: 0.001
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    type: cosine
+    min_lr: 0.00001
+    warmup_epochs: 5
+  loss:
+    occupancy_weight: 1.0
+    semantic_weight: 0.5
+    focal_alpha: 0.75
+    focal_gamma: 2.0
+    class_weights: [1.0, 5.0, 10.0, 8.0, 3.0]
+  augmentation:
+    random_flip: true
+    random_rotate: [-45.0, 45.0]  # degrees
+    random_scale: [0.9, 1.1]
+    point_dropout: 0.1
+
+# Evaluation
+evaluation:
+  metrics:
+    - occupancy_iou
+    - free_space_iou
+    - mean_iou
+    - per_class_iou
+    - accuracy
+  visualization:
+    save_predictions: true
+    overlay_on_lidar: true
+
+# Hardware
+hardware:
+  num_gpus: 1
+  num_workers: 4
+  mixed_precision: true
+  pin_memory: true

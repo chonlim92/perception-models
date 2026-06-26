@@ -1,0 +1,376 @@
+# =============================================================================
+# PETR Base Configuration - ResNet-50 Backbone
+# =============================================================================
+# Training configuration for PETR (Position Embedding Transformation) model.
+# PETR performs 3D object detection from multi-view cameras by encoding 3D
+# position information into image features via learned position embeddings,
+# enabling a standard transformer decoder to reason in 3D space without
+# explicit BEV construction or projection operations.
+#
+# Key Innovation: 3D Position Embedding (3D PE) transforms camera frustum
+# coordinates into 3D world space, encodes them with an MLP, and adds them
+# to image features. This allows global cross-attention between object queries
+# and position-aware 2D features to implicitly perform 3D reasoning.
+#
+# Reference: PETR: Position Embedding Transformation for Multi-View 3D Object
+#            Detection (ECCV 2022)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+model:
+  type: petr
+
+  # --- Image Backbone ---
+  backbone:
+    type: resnet50
+    # Use ImageNet-pretrained weights for transfer learning
+    pretrained: true
+    pretrained_weights: imagenet
+    # Return feature maps from stages 2, 3, 4 (C3, C4, C5)
+    # Corresponding to 1/8, 1/16, 1/32 of input resolution
+    out_indices: [1, 2, 3]
+    # Freeze first stage (conv1 + bn1) to preserve low-level features
+    # and reduce memory during training
+    frozen_stages: 1
+    # Freeze batch norm statistics in backbone for stable training
+    # with small effective batch sizes (1 per GPU)
+    norm_eval: true
+    # Use group normalization style: 0 = standard BatchNorm
+    norm_cfg:
+      type: BN
+      requires_grad: false
+
+  # --- Feature Pyramid Network (Neck) ---
+  neck:
+    type: fpn
+    # Input channels from ResNet-50 stages C3, C4, C5
+    # ResNet-50 channel dimensions: [256, 512, 1024, 2048]
+    in_channels: [512, 1024, 2048]
+    # Unified output channel dimension for all FPN levels
+    out_channels: 256
+    # Number of output feature map levels
+    num_outs: 3
+    # Start from index 0 (use all input levels)
+    start_level: 0
+    # Add extra convolution layers on the coarsest level
+    add_extra_convs: on_input
+    # Use ReLU activation after lateral and output convolutions
+    relu_before_extra_convs: true
+
+  # --- 3D Position Embedding Generator ---
+  # This is PETR's core innovation: generating position-aware features
+  # by encoding 3D coordinates from camera frustum space
+  position_embedding:
+    # Depth range for frustum point generation [start, end, step] in meters
+    # Creates a discretized depth grid in camera frustum space
+    # 64 depth bins spanning 1m to 61.2m (step = (61.2-1.0)/63 ≈ 0.956m)
+    depth_start: 1.0
+    depth_end: 61.2
+    depth_step: 0.956
+
+    # Number of depth bins in the frustum
+    # Computed as: ceil((depth_end - depth_start) / depth_step) = 64
+    depth_num: 64
+
+    # 3D position encoding MLP configuration
+    # Transforms 3D world coordinates (x, y, z) into position embeddings
+    # Architecture: Linear(3, embed_dims*4) -> ReLU -> Linear(embed_dims*4, embed_dims)
+    position_mlp:
+      input_dim: 3
+      hidden_dim: 1024    # 256 * 4 = 1024
+      output_dim: 256
+      num_layers: 2
+      activation: relu
+
+    # Whether to normalize 3D coordinates before MLP encoding
+    # Normalizes to [-1, 1] using the point cloud range
+    normalize_coords: true
+
+    # Point cloud range for coordinate normalization
+    # [x_min, y_min, z_min, x_max, y_max, z_max]
+    # Defines the 3D perception volume around the ego vehicle
+    pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+    # Whether to use LID (Linear Increasing Discretization) for depth
+    # LID provides finer granularity at closer ranges where precision matters more
+    use_lid: false
+
+  # --- Transformer Decoder ---
+  # Standard transformer decoder (NOT deformable attention)
+  # Object queries attend to ALL position-aware image features globally
+  # This is feasible because 3D PE already encodes spatial information
+  decoder:
+    # Number of decoder layers for iterative query refinement
+    # Each layer: self-attention -> cross-attention -> FFN
+    num_decoder_layers: 6
+
+    # Number of object queries (max detectable objects per frame)
+    # Set to 900 to ensure sufficient recall for dense urban scenes
+    num_queries: 900
+
+    # Feature/embedding dimension throughout the transformer
+    embed_dims: 256
+
+    # Number of attention heads in multi-head attention
+    num_heads: 8
+
+    # Feed-forward network intermediate dimension
+    # Standard 4x expansion: 256 * 4 = 2048 (but using 2048 directly)
+    ffn_dim: 2048
+
+    # Dropout rate for attention weights and FFN
+    dropout: 0.1
+
+    # Attention type: standard (full) attention, NOT deformable
+    # PETR uses global attention because 3D PE makes spatial reasoning implicit
+    attention_type: standard
+
+    # Pre-normalization (LayerNorm before attention/FFN) vs post-norm
+    pre_norm: false
+
+    # Whether to return intermediate decoder layer outputs for auxiliary loss
+    return_intermediate: true
+
+  # --- Detection Head ---
+  head:
+    # Number of detection classes (nuScenes standard 10 classes)
+    num_classes: 10
+
+    # Bounding box regression code size:
+    # (cx, cy, cz, w, l, h, sin(yaw), cos(yaw), vx, vy) = 10
+    # cx, cy, cz: 3D center position in ego frame
+    # w, l, h: width, length, height of the bounding box
+    # sin(yaw), cos(yaw): heading angle (decomposed for smooth regression)
+    # vx, vy: velocity components in ego frame
+    code_size: 10
+
+    # Number of fully-connected layers in cls/reg branches
+    num_reg_fcs: 2
+
+    # Whether to use sigmoid for classification (vs softmax)
+    # Sigmoid enables multi-label and works better with focal loss
+    use_sigmoid: true
+
+    # Shared FFN layers between classification and regression heads
+    shared_head: false
+
+    # Code weights for normalizing different regression targets
+    # Higher weight = more importance during training
+    # Position (cx,cy,cz) get weight 1.0, dimensions (w,l,h) get 1.0,
+    # angle (sin,cos) get 1.0, velocity (vx,vy) get 0.2 (harder to predict)
+    code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Dataset type
+  dataset: nuscenes
+
+  # Root directory for nuScenes dataset
+  data_root: ./data/nuscenes/
+
+  # Annotation pickle files (pre-processed with mmdet3d tools)
+  train_ann: nuscenes_infos_train.pkl
+  val_ann: nuscenes_infos_val.pkl
+
+  # Input image size [height, width] - nuScenes camera resolution
+  img_size: [900, 1600]
+
+  # Number of surrounding cameras (nuScenes standard 6-camera setup)
+  # FRONT, FRONT_LEFT, FRONT_RIGHT, BACK, BACK_LEFT, BACK_RIGHT
+  num_cams: 6
+
+  # Detection classes in nuScenes (10 classes, order defines class indices)
+  classes:
+    - car
+    - truck
+    - construction_vehicle
+    - bus
+    - trailer
+    - barrier
+    - motorcycle
+    - bicycle
+    - pedestrian
+    - traffic_cone
+
+  # Point cloud range for normalizing 3D coordinates
+  # Must match position_embedding.pc_range
+  pc_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+  # Data augmentation configuration
+  augmentation:
+    # Random resize ratio range [min_scale, max_scale]
+    # Applied to input images before backbone
+    resize: [0.38, 0.55]
+
+    # Random rotation range in degrees (applied in 3D space)
+    rotation: [-5.4, 5.4]
+
+    # Horizontal flip probability
+    # Note: multi-view flip must swap left/right camera pairs
+    flip: 0.5
+
+    # GridMask augmentation for regularization
+    grid_mask:
+      enabled: true
+      probability: 0.7
+      x_range: [64, 128]
+      y_range: [64, 128]
+      ratio: 0.5
+
+    # Color jitter for photometric augmentation
+    color_jitter:
+      enabled: true
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+
+  # Data loading configuration
+  workers_per_gpu: 4
+  shuffle: true
+  # Pin memory for faster GPU transfer
+  pin_memory: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  # Total training epochs
+  # PETR typically trains for 24 epochs on nuScenes
+  epochs: 24
+
+  # Batch size per GPU
+  # Limited to 1 due to high memory usage from multi-camera inputs
+  # and global attention over all image features
+  batch_size: 1
+
+  # Number of GPUs for distributed data-parallel training
+  num_gpus: 8
+
+  # Effective batch size = batch_size * num_gpus = 8
+
+  # Optimizer configuration
+  optimizer: AdamW
+  # Base learning rate (scaled for effective batch size of 8)
+  lr: 2.0e-4
+  # Weight decay for regularization (excludes bias and norm layers)
+  weight_decay: 0.01
+  # Adam betas: (momentum, squared gradient momentum)
+  betas: [0.9, 0.999]
+
+  # Gradient clipping max norm to prevent exploding gradients
+  # Transformer training can have unstable gradients early in training
+  grad_clip: 35.0
+
+  # Learning rate schedule
+  lr_schedule:
+    # Cosine annealing provides smooth decay and good final performance
+    type: cosine
+    # Linear warmup to stabilize early training
+    warmup: linear
+    # Number of warmup iterations (steps, not epochs)
+    warmup_iters: 500
+    # Initial LR ratio during warmup: start_lr = lr * warmup_ratio
+    warmup_ratio: 0.33
+    # Minimum LR ratio at end of cosine schedule
+    min_lr_ratio: 1.0e-3
+
+  # Backbone learning rate multiplier
+  # Lower LR for pretrained backbone to prevent catastrophic forgetting
+  backbone_lr_mult: 0.1
+
+  # Mixed precision training (FP16) for memory savings and speed
+  mixed_precision: true
+  fp16_loss_scale: dynamic
+
+  # Exponential moving average of model weights
+  ema: false
+
+  # Checkpoint saving interval (epochs)
+  checkpoint_interval: 1
+
+  # Validation interval (epochs)
+  eval_interval: 1
+
+  # Resume training from a checkpoint path (null = train from scratch)
+  resume_from: null
+
+  # Random seed for reproducibility
+  seed: 0
+
+  # Distributed training backend
+  dist_backend: nccl
+
+  # Whether to use class-balanced grouping and sampling (CBGS)
+  # Oversamples rare classes (construction_vehicle, bicycle, etc.)
+  cbgs: false
+
+# -----------------------------------------------------------------------------
+# Loss Configuration
+# -----------------------------------------------------------------------------
+loss:
+  # Classification loss: Focal Loss handles extreme class imbalance
+  # (most queries are background, few match ground truth)
+  cls_loss:
+    type: focal_loss
+    # Alpha: balancing factor for positive vs negative examples
+    alpha: 0.25
+    # Gamma: focusing parameter (higher = more focus on hard examples)
+    gamma: 2.0
+    # Loss weight in total loss
+    weight: 2.0
+
+  # Bounding box regression loss: L1 loss on normalized coordinates
+  bbox_loss:
+    type: l1_loss
+    # Loss weight (balanced against classification loss)
+    weight: 0.25
+
+  # IoU loss: not used in base PETR
+  iou_loss:
+    type: none
+    weight: 0.0
+
+  # Hungarian matcher for bipartite matching between predictions and GT
+  # Determines which prediction is responsible for each ground truth box
+  matcher:
+    type: hungarian
+    # Matching cost weights (should roughly align with loss weights)
+    cls_cost: 2.0
+    bbox_cost: 0.25
+    iou_cost: 0.0
+
+  # Auxiliary losses from intermediate decoder layers
+  # Each intermediate layer's output is supervised with the same losses
+  # Helps with gradient flow and speeds up convergence
+  auxiliary_loss: true
+
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
+evaluation:
+  # nuScenes Detection Score (NDS) metrics
+  # NDS = (5*mAP + sum(1-min(1,mATE,mASE,mAOE,mAVE,mAAE))) / 10
+  metrics:
+    - mAP        # Mean Average Precision (2D center distance matching)
+    - NDS        # nuScenes Detection Score (composite metric)
+    - mATE       # Mean Average Translation Error (meters)
+    - mASE       # Mean Average Scale Error (1 - IoU after alignment)
+    - mAOE       # Mean Average Orientation Error (radians)
+    - mAVE       # Mean Average Velocity Error (m/s)
+    - mAAE       # Mean Average Attribute Error (1 - accuracy)
+
+  # Post-processing configuration
+  nms:
+    enabled: true
+    # Minimum confidence score to keep a detection
+    score_threshold: 0.1
+    # Maximum number of detections to output per frame
+    max_per_frame: 300
+
+  # Expected performance (PETR-R50 on nuScenes val):
+  # mAP: ~31.3, NDS: ~38.1
