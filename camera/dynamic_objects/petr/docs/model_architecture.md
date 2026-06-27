@@ -567,3 +567,71 @@ Note: StreamPETR is faster partly because optimized implementations
 can batch the attention more efficiently when queries are primed
 with good initial positions (propagated queries).
 ```
+
+---
+
+## Hierarchical Lane Positional Embeddings (Enhancement)
+
+This model has been enhanced with topology-aware hierarchical lane positional embeddings for lane detection.
+
+### Architecture
+
+PETR's core mechanism is encoding 3D spatial information into position embeddings that are added to image features, enabling global cross-attention without explicit geometric projection. The hierarchical lane PE extends this paradigm by providing topology-aware positional embeddings for lane queries that participate in **global cross-attention to 3D position-aware features**. Lane queries receive gated dynamic position injection where the topology encoding (lane/boundary/point structure) is fused with the query content via a learned gate, then the queries attend globally to the full set of position-aware image features (F_image + PE_3d). This preserves PETR's signature design of using position embeddings for implicit 3D reasoning while adding explicit lane topology awareness.
+
+### Key Components
+
+- `HierarchicalLanePositionalEmbedding` class: Generates sinusoidal positional embeddings encoding the three-level lane hierarchy (lane index, boundary type, point index). The embedding interacts with PETR's 3D position-aware features during cross-attention, providing the decoder with both 3D spatial context (from image PE) and topological lane structure (from lane PE).
+- `LanePETRDecoderLayer` class: A PETR-style decoder layer for lane detection that uses standard (non-deformable) multi-head cross-attention. Lane queries with injected topology PE attend globally to all position-aware image features across all cameras, leveraging the full 178,500-token memory.
+
+### Implementation Details
+
+- Gated dynamic position injection -- topology PE is combined with lane query content through a sigmoid gate before cross-attention
+- Global cross-attention to 3D position-aware features (not deformable) -- maintains PETR's philosophy that position embeddings encode spatial information implicitly
+- Attention pattern: Q = lane_queries + gated_topo_PE, K = F_position_aware, V = F_image
+- No explicit geometric projection for lane queries -- 3D awareness comes entirely from the position-embedded keys
+- Cross-attention matrix size: (1000, 178500) per head -- manageable with mixed precision
+
+### Design Decisions
+
+- Balanced magnitude initialization (sinusoidal scaled to 0.02)
+- Dropout 0.05 (reduced for geometric tasks)
+- Inference caching with device-safe invalidation (_apply override)
+- get_lane_mask returns clone for safety
+
+### Query Layout
+
+```
+Total: 1000 queries (25 lanes x 2 lines x 20 points)
+[0-19]:    Lane 0, Left boundary, points 0-19
+[20-39]:   Lane 0, Right boundary, points 0-19
+[40-59]:   Lane 1, Left boundary, points 0-19
+...
+[980-999]: Lane 24, Right boundary, points 0-19
+```
+
+### Usage Example
+
+```python
+from models.lane_pe import HierarchicalLanePositionalEmbedding
+
+# Initialize lane PE for PETR-style global attention
+lane_pe = HierarchicalLanePositionalEmbedding(
+    embed_dim=256,
+    num_lanes=25,
+    points_per_lane=20,
+    num_boundaries=2
+)
+
+# Get topology-aware positional embeddings
+topo_pe = lane_pe()  # (1000, 256)
+
+# Gated injection into lane queries
+gate = torch.sigmoid(gate_proj(torch.cat([lane_queries, topo_pe.expand(B, -1, -1)], dim=-1)))
+lane_queries_positioned = lane_queries + gate * topo_pe
+
+# Global cross-attention to PETR's position-aware features
+# Q: lane_queries_positioned (B, 1000, 256)
+# K: F_position_aware (B, 178500, 256) = F_image + PE_3d
+# V: F_image (B, 178500, 256)
+output = cross_attention(lane_queries_positioned, F_position_aware, F_image)
+```

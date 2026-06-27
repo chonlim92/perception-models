@@ -722,3 +722,76 @@ StreamMapNet stores only ONE tensor of size (256, 200, 100) = 5.12M values = 20 
 - Carion et al. (2020). End-to-End Object Detection with Transformers (DETR). ECCV 2020.
 - Zhu et al. (2021). Deformable DETR: Deformable Transformers for End-to-End Object Detection. ICLR 2021.
 - Yuan et al. (2024). StreamMapNet: Streaming Mapping Network for Vectorized Online HD Map Construction. WACV 2024.
+
+---
+
+## Hierarchical Lane Positional Embeddings (Enhancement)
+
+This model has been enhanced with topology-aware hierarchical lane positional embeddings for lane detection.
+
+### Architecture
+
+StreamMapNet's decoder uses deformable cross-attention to attend to BEV features, with reference point refinement across 6 layers. The hierarchical lane PE is integrated via **position injection to Q/K only** (not to the residual stream), preserving the clean residual pathway that is critical for StreamMapNet's temporal fusion stability. The lane PE provides topology-aware structure to the attention mechanism without corrupting the feature representations that flow into the temporal hidden state. BEV positional interpolation is performed in fp32 to maintain precision when the BEV resolution changes between training and inference.
+
+### Key Components
+
+- `HierarchicalLanePositionalEmbedding` class: Generates sinusoidal positional embeddings encoding lane topology (lane index, boundary type, point index). The embeddings are injected only into Q and K projections of the self-attention layers, biasing attention patterns toward topologically-related queries without modifying the residual stream values.
+- `LaneStreamDecoder` class: StreamMapNet-adapted decoder that applies lane PE to Q/K projections only. Uses a pre-computed decoupled attention mask (block-diagonal, 25 blocks of 40x40) to restrict self-attention to intra-lane interactions. BEV positional features used in cross-attention are interpolated in fp32 when spatial dimensions differ from the pre-computed grid.
+
+### Implementation Details
+
+- Position injection to Q/K only (not residual stream) -- prevents topology bias from contaminating temporal hidden state propagation
+- Pre-computed decoupled mask: (1000, 1000) boolean block-diagonal, restricts self-attention to within-lane groups
+- fp32 BEV positional interpolation: when BEV features are at a different resolution than the reference grid, `F.interpolate` is performed in fp32 before casting back to the working precision
+- Compatible with StreamMapNet's temporal fusion: the hidden state H_t carries only content features (no PE leakage), so ego-motion warping remains geometrically correct
+- Mask and PE are pre-computed at initialization and cached; device transfer handled via `_apply` override
+
+### Design Decisions
+
+- Balanced magnitude initialization (sinusoidal scaled to 0.02)
+- Dropout 0.05 (reduced for geometric tasks)
+- Inference caching with device-safe invalidation (_apply override)
+- get_lane_mask returns clone for safety
+
+### Query Layout
+
+```
+Total: 1000 queries (25 lanes x 2 lines x 20 points)
+[0-19]:    Lane 0, Left boundary, points 0-19
+[20-39]:   Lane 0, Right boundary, points 0-19
+[40-59]:   Lane 1, Left boundary, points 0-19
+...
+[980-999]: Lane 24, Right boundary, points 0-19
+```
+
+### Usage Example
+
+```python
+from models.lane_pe import HierarchicalLanePositionalEmbedding
+
+# Initialize for StreamMapNet (Q/K injection mode)
+lane_pe = HierarchicalLanePositionalEmbedding(
+    embed_dim=256,
+    num_lanes=25,
+    points_per_lane=20,
+    num_boundaries=2
+)
+
+# Get topology PE and mask
+topo_pe = lane_pe()                      # (1000, 256)
+lane_mask = lane_pe.get_lane_mask()      # (1000, 1000) boolean
+
+# Inject into Q/K only (not residual stream)
+Q = W_q(lane_queries) + topo_pe          # topology-biased queries
+K = W_k(lane_queries) + topo_pe          # topology-biased keys
+V = W_v(lane_queries)                    # unmodified values
+
+# Self-attention with decoupled mask
+attn_logits = Q @ K.transpose(-1, -2) / sqrt(d_k)
+attn_logits = attn_logits.masked_fill(~lane_mask, float('-inf'))
+attn_output = softmax(attn_logits, dim=-1) @ V
+
+# BEV cross-attention with fp32 positional interpolation
+bev_pos = F.interpolate(bev_pos_grid.float(), size=(H_bev, W_bev), mode='bilinear').to(lane_queries.dtype)
+output = deformable_cross_attention(lane_queries, bev_features + bev_pos, reference_points)
+```

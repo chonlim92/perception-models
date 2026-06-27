@@ -583,3 +583,74 @@ Predictions:
 4. **Deformable attention**: Enables efficient cross-attention to large BEV feature maps without quadratic memory cost.
 
 5. **Auxiliary losses at every decoder layer**: Provides gradients throughout the decoder depth, improving training stability.
+
+---
+
+## Hierarchical Lane Positional Embeddings (Enhancement)
+
+This model has been enhanced with topology-aware hierarchical lane positional embeddings for lane detection.
+
+### Architecture
+
+MapTR already uses a hierarchical query structure (instance queries + point queries), making it a natural fit for hierarchical lane PE. The enhancement adds **per-head geometric ALiBi (Attention with Linear Biases) slopes** to the self-attention mechanism, where each attention head receives a different geometric decay rate that biases attention toward topologically-related queries. Additionally, a lazy-cached multi-head attention mask encodes the lane topology structure and is combined with ALiBi slopes to produce the final attention bias. Reference point refinement operates in 2D (BEV plane) since MapTR predicts map elements as 2D polylines.
+
+### Key Components
+
+- `HierarchicalLanePositionalEmbedding` class: Generates sinusoidal positional embeddings for the lane query hierarchy. Integrates with MapTR's existing instance+point query decomposition by encoding lane-level topology (which lane, which boundary) at the instance level and point-level ordering at the point query level.
+- `LaneMapDecoderLayer` class: Extended MapTR decoder layer with per-head ALiBi slopes that provide a geometric attention bias. Each of the 8 attention heads gets a different slope (geometric series: 2^(-1/8), 2^(-2/8), ..., 2^(-8/8)), causing some heads to focus locally (within-boundary) and others to attend more broadly (cross-boundary, cross-lane). The attention mask is lazy-cached on first forward pass and invalidated on device transfer.
+
+### Implementation Details
+
+- Per-head geometric ALiBi slopes applied to self-attention logits -- biases each head toward different topological distances
+- Lazy-cached multi-head attention mask: computed once on first forward, stored as buffer, invalidated on `.to(device)` via `_apply` override
+- 2D reference refinement: `ref_new = sigmoid(inverse_sigmoid(ref_old) + delta)` where delta is (M * N_pts, 2) in the BEV plane
+- ALiBi distance matrix: computed from topological distance (|lane_i - lane_j| * stride + |point_i - point_j|) rather than sequential position
+- Compatible with MapTR's decoupled self-attention (MapTRv2) -- ALiBi applied within both instance-level and point-level attention separately
+
+### Design Decisions
+
+- Balanced magnitude initialization (sinusoidal scaled to 0.02)
+- Dropout 0.05 (reduced for geometric tasks)
+- Inference caching with device-safe invalidation (_apply override)
+- get_lane_mask returns clone for safety
+
+### Query Layout
+
+```
+Total: 1000 queries (25 lanes x 2 lines x 20 points)
+[0-19]:    Lane 0, Left boundary, points 0-19
+[20-39]:   Lane 0, Right boundary, points 0-19
+[40-59]:   Lane 1, Left boundary, points 0-19
+...
+[980-999]: Lane 24, Right boundary, points 0-19
+```
+
+### Usage Example
+
+```python
+from models.lane_pe import HierarchicalLanePositionalEmbedding
+
+# Initialize with ALiBi slopes for 8 attention heads
+lane_pe = HierarchicalLanePositionalEmbedding(
+    embed_dim=256,
+    num_lanes=25,
+    points_per_lane=20,
+    num_boundaries=2,
+    num_heads=8,
+    use_alibi=True
+)
+
+# Get positional embeddings and ALiBi bias
+topo_pe = lane_pe()                          # (1000, 256)
+alibi_bias = lane_pe.get_alibi_bias()        # (8, 1000, 1000) per-head bias
+lane_mask = lane_pe.get_lane_mask()          # (1000, 1000) boolean
+
+# Integrate with MapTR's hierarchical queries
+instance_queries = instance_embed.unsqueeze(1) + topo_pe.view(25, 40, 256).mean(dim=1, keepdim=True)
+point_queries = point_embed.unsqueeze(0) + topo_pe.view(25, 2, 20, 256)
+
+# Self-attention with ALiBi bias
+attn_logits = Q @ K.transpose(-1, -2) / sqrt(d_k)
+attn_logits = attn_logits + alibi_bias  # add per-head geometric bias
+attn_weights = softmax(attn_logits + lane_mask.float().masked_fill(~lane_mask, -1e9), dim=-1)
+```

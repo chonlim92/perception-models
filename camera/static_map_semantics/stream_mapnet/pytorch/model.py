@@ -710,29 +710,42 @@ class MapDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
 
     def forward(
-        self, queries: torch.Tensor, memory: torch.Tensor
+        self,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
+        query_pos: Optional[torch.Tensor] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            queries: (B, N_q, d_model) map element queries
+            queries: (B, N_q, d_model) map element queries (content only)
             memory: (B, H*W, d_model) flattened BEV features
+            query_pos: (B, N_q, d_model) positional encoding added to Q/K only
+            self_attn_mask: (N_q, N_q) attention mask for self-attention
 
         Returns:
             queries: (B, N_q, d_model) updated queries
         """
-        # Self-attention
+        # Self-attention (pos added only to Q and K, not the residual stream)
+        residual = queries
         q = self.norm1(queries)
-        q2, _ = self.self_attn(q, q, q)
-        queries = queries + self.dropout1(q2)
+        if query_pos is not None:
+            q = q + query_pos
+        q2, _ = self.self_attn(q, q, self.norm1(queries), attn_mask=self_attn_mask)
+        queries = residual + self.dropout1(q2)
 
-        # Cross-attention to BEV
+        # Cross-attention to BEV (pos added only to Q)
+        residual = queries
         q = self.norm2(queries)
+        if query_pos is not None:
+            q = q + query_pos
         q2, _ = self.cross_attn(q, memory, memory)
-        queries = queries + self.dropout2(q2)
+        queries = residual + self.dropout2(q2)
 
         # FFN
+        residual = queries
         q = self.norm3(queries)
-        queries = queries + self.dropout3(self.ffn(q))
+        queries = residual + self.dropout3(self.ffn(q))
 
         return queries
 
@@ -899,7 +912,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
-        pos_drop: float = 0.1,
+        pos_drop: float = 0.05,
     ) -> None:
         """Initialize hierarchical lane positional embeddings.
 
@@ -912,6 +925,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
             pos_drop: Dropout rate on summed positional embedding.
         """
         super().__init__()
+        assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
         self.embed_dim = embed_dim
         self.num_lanes = num_lanes
         self.points_per_line = points_per_line
@@ -951,7 +965,8 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
             * (-math.log(10000.0) / embed_dim)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe * 0.02
         self.register_buffer("point_sinusoidal", pe)
 
     def _point_embedding(self, point_ids: torch.Tensor) -> torch.Tensor:
@@ -960,8 +975,13 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.lane_embedding.weight, std=0.02)
         nn.init.normal_(self.line_type_embedding.weight, std=0.02)
-        nn.init.normal_(self.point_residual.weight, std=0.01)
+        nn.init.normal_(self.point_residual.weight, std=0.02)
         nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _apply(self, fn):
+        """Invalidate inference cache on device/dtype change."""
+        self._cached_pos = None
+        return super()._apply(fn)
 
     def _build_index_tables(self) -> None:
         """Pre-compute index tensors for efficient lookup."""
@@ -1018,7 +1038,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
 
     def get_lane_mask(self) -> torch.Tensor:
         """Return boolean mask identifying lane queries vs other-line queries."""
-        return self.lane_mask
+        return self.lane_mask.clone()
 
 
 class HierarchicalMapDecoder(nn.Module):
@@ -1101,6 +1121,11 @@ class HierarchicalMapDecoder(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
+        # Pre-compute decoupled self-attention mask as buffer
+        self.register_buffer(
+            "_self_attn_mask", self._build_decoupled_self_attn_mask()
+        )
+
         # Per-point 2D coordinate prediction
         self.pts_head = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -1116,6 +1141,16 @@ class HierarchicalMapDecoder(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, 4),
         )
+
+    def _build_decoupled_self_attn_mask(self) -> torch.Tensor:
+        """Build block-diagonal self-attention mask for lane-structured queries."""
+        total_q = self.total_queries
+        mask = torch.full((total_q, total_q), float("-inf"))
+        for line_idx in range(self.num_total_lines):
+            start = line_idx * self.points_per_line
+            end = start + self.points_per_line
+            mask[start:end, start:end] = 0.0
+        return mask
 
     def _get_bev_pos(self, H: int, W: int, device: torch.device) -> torch.Tensor:
         """Get BEV positional encoding, interpolating if spatial size changed."""
@@ -1160,10 +1195,14 @@ class HierarchicalMapDecoder(nn.Module):
         queries = query_content.unsqueeze(0).expand(B, -1, -1)
         query_pos_expanded = query_pos.unsqueeze(0).expand(B, -1, -1)
 
-        # Apply decoder layers with per-layer position injection
+        # Apply decoder layers: pos added to Q/K only (not residual stream)
         aux_outputs = []
         for i, layer in enumerate(self.layers):
-            queries = layer(queries + query_pos_expanded, memory)
+            queries = layer(
+                queries, memory,
+                query_pos=query_pos_expanded,
+                self_attn_mask=self._self_attn_mask,
+            )
 
             if self.auxiliary_loss and i < self.num_decoder_layers - 1:
                 q_normed = self.final_norm(queries)

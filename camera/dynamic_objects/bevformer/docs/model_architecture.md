@@ -642,3 +642,67 @@ for layer_idx in range(6):
 | Classification (Focal) | 2.0 | Higher weight because most queries are background |
 | Regression (L1) | 0.25 | Lower weight because box params have larger magnitude |
 | GIoU | 0.0 | Not used (3D IoU is expensive and noisy) |
+
+---
+
+## Hierarchical Lane Positional Embeddings (Enhancement)
+
+This model has been enhanced with topology-aware hierarchical lane positional embeddings for lane detection.
+
+### Architecture
+
+BEVFormer's BEV encoder produces a dense spatial feature map (B, 256, 200, 200) that naturally lends itself to lane detection tasks. The hierarchical lane PE is injected as a **static positional embedding** added to the BEV queries before they enter the lane detection decoder. Since BEVFormer already maintains a spatially-structured BEV grid, the lane PE provides fixed topology-aware positional bias that encodes which query corresponds to which lane, boundary side, and point index -- without requiring dynamic 3D reference point projection.
+
+### Key Components
+
+- `HierarchicalLanePositionalEmbedding` class: Generates a fixed sinusoidal positional embedding of shape (1000, 256) encoding a three-level hierarchy: lane index (25 lanes), boundary type (left/right), and point index (20 points per boundary). The embedding is pre-computed, scaled to magnitude 0.02, and cached for efficient reuse.
+- `LaneDetectionDecoder` class: A transformer decoder that consumes 1000 lane queries attending to the BEV feature map. Uses a pre-computed decoupled attention mask that restricts self-attention to within-lane interactions (queries from different lanes do not attend to each other), enforcing topological structure.
+
+### Implementation Details
+
+- Static positional embedding only -- no gated dynamic injection since BEV queries lack per-point 3D reference coordinates
+- `LaneDetectionDecoder` with pre-computed decoupled mask restricting self-attention to intra-lane query groups (40 queries per lane)
+- Lane PE is added once before the first decoder layer (not re-injected per layer)
+- Mask shape: (1000, 1000) boolean, block-diagonal with 25 blocks of size 40x40
+
+### Design Decisions
+
+- Balanced magnitude initialization (sinusoidal scaled to 0.02)
+- Dropout 0.05 (reduced for geometric tasks)
+- Inference caching with device-safe invalidation (_apply override)
+- get_lane_mask returns clone for safety
+
+### Query Layout
+
+```
+Total: 1000 queries (25 lanes x 2 lines x 20 points)
+[0-19]:    Lane 0, Left boundary, points 0-19
+[20-39]:   Lane 0, Right boundary, points 0-19
+[40-59]:   Lane 1, Left boundary, points 0-19
+...
+[980-999]: Lane 24, Right boundary, points 0-19
+```
+
+### Usage Example
+
+```python
+from models.lane_pe import HierarchicalLanePositionalEmbedding
+
+# Initialize the lane PE module
+lane_pe = HierarchicalLanePositionalEmbedding(
+    embed_dim=256,
+    num_lanes=25,
+    points_per_lane=20,
+    num_boundaries=2
+)
+
+# Get positional embeddings and attention mask
+pos_embed = lane_pe()                    # (1000, 256)
+lane_mask = lane_pe.get_lane_mask()      # (1000, 1000) boolean
+
+# Add to BEV lane queries before decoder
+lane_queries = learnable_lane_queries + pos_embed  # (B, 1000, 256)
+
+# Pass to decoder with decoupled mask
+output = lane_decoder(lane_queries, bev_features, attn_mask=lane_mask)
+```

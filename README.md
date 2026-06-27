@@ -1,6 +1,6 @@
 # Autonomous Driving Perception Models
 
-A comprehensive, production-quality repository of state-of-the-art deep learning perception models for autonomous driving. Each model includes full research documentation, PyTorch and TensorFlow implementations, training scripts, evaluation pipelines, and step-by-step guides.
+A comprehensive, production-quality repository of **14 state-of-the-art (SOTA) deep learning perception models** for autonomous driving. Each model includes full research documentation, PyTorch and TensorFlow implementations, training scripts, evaluation pipelines, and step-by-step guides.
 
 ---
 
@@ -11,12 +11,13 @@ A comprehensive, production-quality repository of state-of-the-art deep learning
 3. [Core Concepts You Need to Know](#core-concepts-you-need-to-know)
 4. [Repository Structure](#repository-structure)
 5. [Models Overview](#models-overview)
-6. [Learning Path (Recommended Order)](#learning-path-recommended-order)
-7. [Quick Start](#quick-start)
-8. [Datasets Supported](#datasets-supported)
-9. [Hardware Requirements](#hardware-requirements)
-10. [Metrics Reference](#metrics-reference)
-11. [Contributing](#contributing)
+6. [Hierarchical Lane Positional Embeddings](#hierarchical-lane-positional-embeddings)
+7. [Learning Path (Recommended Order)](#learning-path-recommended-order)
+8. [Quick Start](#quick-start)
+9. [Datasets Supported](#datasets-supported)
+10. [Hardware Requirements](#hardware-requirements)
+11. [Metrics Reference](#metrics-reference)
+12. [Contributing](#contributing)
 
 ---
 
@@ -334,11 +335,11 @@ model_name/
 
 These models predict the road structure (lane lines, road boundaries, pedestrian crossings) from camera images, typically outputting a Bird's Eye View map.
 
-| Model | Key Innovation | Temporal | Representation | mAP (nuScenes) |
-|-------|---------------|----------|----------------|-----------------|
-| **StreamMapNet** | Streaming temporal BEV fusion for stable map prediction | Yes (multi-frame) | Vectorized (polylines) | 62.3 |
-| **MapTR/v2** | Permutation-equivalent set prediction + hierarchical matching | No (single frame) | Vectorized (polylines) | 58.7 |
-| **HDMapNet** | First end-to-end camera→BEV semantic map framework | No | Rasterized (segmentation) | 38.5 |
+| Model | Key Innovation | Temporal | Representation | mAP (nuScenes) | Hierarchical PE |
+|-------|---------------|----------|----------------|-----------------|-----------------|
+| **StreamMapNet** | Streaming temporal BEV fusion for stable map prediction | Yes (multi-frame) | Vectorized (polylines) | 62.3 | Yes |
+| **MapTR/v2** | Permutation-equivalent set prediction + hierarchical matching | No (single frame) | Vectorized (polylines) | 58.7 | Yes |
+| **HDMapNet** | First end-to-end camera→BEV semantic map framework | No | Rasterized (segmentation) | 38.5 | -- |
 
 **Evolution**: HDMapNet (rasterized) → MapTR (vectorized, single-frame) → StreamMapNet (vectorized, temporal)
 
@@ -346,12 +347,12 @@ These models predict the road structure (lane lines, road boundaries, pedestrian
 
 These models detect 3D bounding boxes (position, size, orientation, velocity) of objects from multi-camera images — the most challenging camera perception task.
 
-| Model | Key Innovation | Temporal | mAP / NDS |
-|-------|---------------|----------|-----------|
-| **BEVFormer** | Deformable attention for BEV generation + temporal self-attention | Yes | 51.7 / 59.6 |
-| **StreamPETR** | Object-centric temporal propagation via query passing | Yes | 50.4 / 59.2 |
-| **PETR** | 3D position embedding (encode 3D coords into 2D features) | No | 38.3 / 44.2 |
-| **DETR3D** | 3D reference point → project to 2D → sample features | No | 34.9 / 42.2 |
+| Model | Key Innovation | Temporal | mAP / NDS | Hierarchical PE |
+|-------|---------------|----------|-----------|-----------------|
+| **BEVFormer** | Deformable attention for BEV generation + temporal self-attention | Yes | 51.7 / 59.6 | Yes |
+| **StreamPETR** | Object-centric temporal propagation via query passing | Yes | 50.4 / 59.2 | -- |
+| **PETR** | 3D position embedding (encode 3D coords into 2D features) | No | 38.3 / 44.2 | Yes |
+| **DETR3D** | 3D reference point → project to 2D → sample features | No | 34.9 / 42.2 | Yes |
 
 **Evolution**: DETR3D (project & sample) → PETR (position embedding) → BEVFormer (deformable BEV) → StreamPETR (temporal queries)
 
@@ -387,6 +388,75 @@ Radar-based perception is the most challenging due to extreme sparsity, but rada
 | **CRAFT** | Camera-Radar spatio-contextual fusion transformer | Camera+Radar | 41.1 |
 | **RadarPillarNet** | PointPillars adapted for sparse radar (larger pillars, velocity features) | Radar-only | 28.3 |
 | **Radar Occupancy** | Bayesian/neural occupancy grid from radar (classical + learned) | Radar-only | IoU: 62.4 |
+
+---
+
+## Hierarchical Lane Positional Embeddings
+
+A novel contribution in this repository that enhances lane detection models with **topology-aware positional encodings**. Instead of using flat, unstructured query embeddings, this system explicitly encodes the inherent lane-line-point hierarchy into the positional embedding space.
+
+### What It Is
+
+A hierarchical positional embedding system that replaces flat query embeddings with structure-aware encodings reflecting the lane topology. The hierarchy encodes:
+
+```
+25 lanes x 2 boundary lines x 20 points = 1000 lane queries
+
+Lane Level        Line Level         Point Level
+(which lane?)     (left/right        (position along
+                   boundary)          the polyline)
+     │                 │                    │
+     ▼                 ▼                    ▼
+┌─────────┐      ┌──────────┐       ┌────────────┐
+│ Lane ID │      │ Boundary │       │  Sampled   │
+│  embed  │      │   embed  │       │   Point    │
+│ (1..25) │      │  (L / R) │       │   embed    │
+└────┬────┘      └────┬─────┘       │  (1..20)  │
+     │                │              └─────┬──────┘
+     └────────────────┼────────────────────┘
+                      │
+                      ▼
+          ┌───────────────────────┐
+          │  Hierarchical Positional │
+          │       Embedding          │
+          │  (sum / concat / gate)   │
+          └───────────┬─────────────┘
+                      │
+                      ▼
+          ┌───────────────────────┐
+          │   Lane Query (input   │
+          │   to transformer      │
+          │   decoder)            │
+          └───────────────────────┘
+```
+
+Each query knows *which lane* it belongs to, *which boundary line* (left or right), and *where along that line* it sits -- enabling the transformer to reason about lane structure rather than learning it implicitly.
+
+### Enhanced Models
+
+The following 5 models have been enhanced with hierarchical lane positional embeddings:
+
+| Model | Integration Notes |
+|-------|-------------------|
+| **BEVFormer** | Hierarchical PE replaces flat BEV lane queries in the decoder |
+| **DETR3D** | 3D reference points augmented with lane-topology-aware embeddings |
+| **PETR** | 3D position embeddings extended with hierarchical lane structure |
+| **MapTR** | Per-head geometric ALiBi distance bias for lane-aware attention |
+| **StreamMapNet** | Temporal lane queries carry hierarchical structure across frames |
+
+### Key Features
+
+- **Balanced magnitude sinusoidal + learned embeddings** for fast convergence -- sinusoidal provides a good initialization while learned components adapt to the data
+- **Decoupled block-diagonal self-attention** (intra-line only) -- points within the same boundary line attend to each other, reducing O(N^2) to O(N_line^2) and enforcing lane structure
+- **Per-head geometric ALiBi distance bias** (MapTR) -- different attention heads see different distance-based biases along the polyline, enabling multi-scale lane reasoning
+- **Gated dynamic position injection** from iterative reference points -- a learned gate blends static hierarchical PE with dynamic positions refined during decoder iterations
+- **Inference caching with device-safe invalidation** -- precomputed embeddings are cached and automatically invalidated when moving between devices (CPU/GPU)
+- **Smooth-L1 lane width consistency loss** -- regularizes left/right boundary predictions to maintain physically plausible lane widths
+- **Shared utilities in `common/lane_topology.py`** -- reusable building blocks for all models (hierarchy construction, embedding generation, cache management)
+
+### Documentation
+
+See `docs/hierarchical_lane_positional_embeddings.md` for full implementation details, ablation studies, and integration guides.
 
 ---
 
@@ -646,6 +716,13 @@ nuScenes is the most commonly used dataset in this repository. Key facts:
 - GKT (Geometry-guided Kernel Transformer): Camera-geometry-guided cross-attention
 - Voxelization + BEV Collapse (CenterPoint)
 - Pillar Encoding + Scatter (PointPillars, RadarPillarNet)
+
+### Hierarchical Lane Positional Embeddings
+- Topology-aware positional encodings (lane/line/point hierarchy)
+- Block-diagonal self-attention for intra-line reasoning
+- Per-head ALiBi distance bias (MapTR)
+- Gated dynamic position injection from iterative refinement
+- Integrated in: BEVFormer, DETR3D, PETR, MapTR, StreamMapNet
 
 ### Point Cloud Processing
 - Farthest Point Sampling (FPS)

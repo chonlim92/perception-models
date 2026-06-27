@@ -421,9 +421,10 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
-        pos_drop: float = 0.1,
+        pos_drop: float = 0.05,
     ) -> None:
         super().__init__()
+        assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
         self.embed_dim = embed_dim
         self.num_lanes = num_lanes
         self.points_per_line = points_per_line
@@ -455,7 +456,8 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
             * (-math.log(10000.0) / embed_dim)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe * 0.02
         self.register_buffer("point_sinusoidal", pe)
 
     def _point_embedding(self, point_ids: torch.Tensor) -> torch.Tensor:
@@ -464,8 +466,13 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.lane_embedding.weight, std=0.02)
         nn.init.normal_(self.line_type_embedding.weight, std=0.02)
-        nn.init.normal_(self.point_residual.weight, std=0.01)
+        nn.init.normal_(self.point_residual.weight, std=0.02)
         nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _apply(self, fn):
+        """Invalidate inference cache on device/dtype change."""
+        self._cached_pos = None
+        return super()._apply(fn)
 
     def _build_index_tables(self) -> None:
         lane_ids, line_type_ids, point_ids = [], [], []
@@ -508,7 +515,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
 
     def get_lane_mask(self) -> torch.Tensor:
         """Return boolean mask identifying lane queries vs other-line queries."""
-        return self.lane_mask
+        return self.lane_mask.clone()
 
 
 class DETR3DLaneDecoder(nn.Module):
@@ -581,11 +588,17 @@ class DETR3DLaneDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Dynamic position injection: project reference points to query_pos space
+        # Dynamic position injection with learnable gate (starts near 0)
         self.query_pos_proj = nn.Sequential(
             nn.Linear(3, embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims, embed_dims),
+        )
+        self.dynamic_pos_gate = nn.Parameter(torch.zeros(1))
+
+        # Register pc_range as buffer to avoid per-call tensor creation
+        self.register_buffer(
+            "_pc_range", torch.tensor(pc_range, dtype=torch.float32)
         )
 
         # 3D reference points for lane points (lanes are on the ground plane)
@@ -615,6 +628,10 @@ class DETR3DLaneDecoder(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
+        # Pre-compute decoupled self-attention mask as buffer
+        self.register_buffer(
+            "_self_attn_mask", self._build_decoupled_self_attn_mask()
+        )
 
     def _build_decoupled_self_attn_mask(self) -> torch.Tensor:
         """Build block-diagonal self-attention mask for lane-structured queries."""
@@ -660,10 +677,8 @@ class DETR3DLaneDecoder(nn.Module):
         reference_points = self.reference_points_embed(combined).sigmoid()
         reference_points = reference_points.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Decoupled self-attention mask
-        self_attn_mask = self._build_decoupled_self_attn_mask().to(
-            device=query.device
-        )
+        # Use pre-computed decoupled self-attention mask
+        self_attn_mask = self._self_attn_mask
 
         intermediate_outputs = []
         intermediate_ref_points = []
@@ -671,8 +686,8 @@ class DETR3DLaneDecoder(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             ref_points_3d = self._denormalize_reference_points(reference_points)
 
-            # Dynamic position injection: combine static hierarchy with ref-point signal
-            query_pos = query_pos_static + self.query_pos_proj(reference_points)
+            # Gated dynamic position injection: gate grows during training
+            query_pos = query_pos_static + self.dynamic_pos_gate.sigmoid() * self.query_pos_proj(reference_points)
 
             query = layer(
                 query=query,
@@ -698,7 +713,7 @@ class DETR3DLaneDecoder(nn.Module):
         return query, intermediate_outputs, intermediate_ref_points
 
     def _denormalize_reference_points(self, ref_points: torch.Tensor) -> torch.Tensor:
-        pc_range = torch.tensor(self.pc_range, device=ref_points.device, dtype=ref_points.dtype)
+        pc_range = self._pc_range.to(dtype=ref_points.dtype)
         return ref_points * (pc_range[3:] - pc_range[:3]) + pc_range[:3]
 
     @staticmethod

@@ -181,8 +181,8 @@ class MapDecoderLayer(nn.Module):
         """Build self-attention mask for decoupled attention (MapTRv2) + ALiBi bias.
 
         In decoupled mode, point queries within the same instance can attend
-        to each other, but not to points from other instances. An ALiBi-style
-        distance-based bias within each block encourages local smoothness.
+        to each other, but not to points from other instances. Per-head geometric
+        ALiBi slopes provide multi-scale locality bias within each block.
 
         Args:
             num_queries: Number of instance queries.
@@ -190,37 +190,38 @@ class MapDecoderLayer(nn.Module):
             device: Device to create the mask on.
 
         Returns:
-            Attention mask of shape [num_queries*num_points, num_queries*num_points]
+            Attention mask of shape [num_heads, num_queries*num_points, num_queries*num_points]
             where -inf means "do NOT attend" and negative values encode distance bias.
         """
         if self.self_attn_mask_type == "none":
             return None
 
         total = num_queries * num_points
-        # Start with all masked (True = blocked)
-        mask = torch.ones(total, total, dtype=torch.bool, device=device)
-        # Unmask within each instance block
-        for i in range(num_queries):
-            start = i * num_points
-            end = start + num_points
-            mask[start:end, start:end] = False
+        num_heads = self.self_attn.num_heads
 
-        # Convert bool mask to float mask: True -> -inf, False -> 0
-        float_mask = torch.zeros(total, total, dtype=torch.float32, device=device)
-        float_mask.masked_fill_(mask, float("-inf"))
+        # Per-head geometric slopes (as in original ALiBi paper)
+        slopes = torch.pow(
+            2.0,
+            -torch.arange(1, num_heads + 1, dtype=torch.float32) * (8.0 / num_heads),
+        ) * 0.5  # scale factor for 20-point sequences
 
-        # Add ALiBi intra-line distance bias (soft locality prior)
+        # Distance matrix within each line block
         point_dists = torch.abs(
-            torch.arange(num_points, dtype=torch.float32, device=device).unsqueeze(0)
-            - torch.arange(num_points, dtype=torch.float32, device=device).unsqueeze(1)
+            torch.arange(num_points, dtype=torch.float32).unsqueeze(0)
+            - torch.arange(num_points, dtype=torch.float32).unsqueeze(1)
         )
-        alibi_slope = 0.1
+
+        # Build multi-head mask
+        float_mask = torch.full(
+            (num_heads, total, total), float("-inf"), dtype=torch.float32
+        )
         for i in range(num_queries):
             start = i * num_points
             end = start + num_points
-            float_mask[start:end, start:end] -= alibi_slope * point_dists
+            for h in range(num_heads):
+                float_mask[h, start:end, start:end] = -slopes[h] * point_dists
 
-        return float_mask
+        return float_mask.to(device)
 
     def forward(
         self,
@@ -248,7 +249,20 @@ class MapDecoderLayer(nn.Module):
         residual = query
         query = self.norm1(query)
         q = k = query + query_pos
-        attn_mask = self._build_self_attn_mask(num_queries, num_points, query.device)
+        # Lazy-cache the mask (topology is fixed, only needs building once)
+        if not hasattr(self, "_cached_attn_mask") or self._cached_attn_mask is None:
+            mask = self._build_self_attn_mask(num_queries, num_points, query.device)
+            if mask is not None:
+                self.register_buffer("_cached_attn_mask", mask, persistent=False)
+            else:
+                self._cached_attn_mask = None
+        attn_mask = self._cached_attn_mask
+        # Expand per-head mask for batch: (num_heads, L, L) -> (B*num_heads, L, L)
+        if attn_mask is not None and attn_mask.dim() == 3:
+            B = query.shape[0]
+            attn_mask = attn_mask.unsqueeze(0).expand(B, -1, -1, -1).reshape(
+                B * attn_mask.shape[0], attn_mask.shape[1], attn_mask.shape[2]
+            )
         query2, _ = self.self_attn(q, k, query, attn_mask=attn_mask)
         query = residual + self.dropout1(query2)
 
@@ -539,9 +553,10 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
-        pos_drop: float = 0.1,
+        pos_drop: float = 0.05,
     ) -> None:
         super().__init__()
+        assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
         self.embed_dim = embed_dim
         self.num_lanes = num_lanes
         self.points_per_line = points_per_line
@@ -577,7 +592,8 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
             * (-math.log(10000.0) / embed_dim)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe * 0.02
         self.register_buffer("point_sinusoidal", pe)
 
     def _point_embedding(self, point_ids: torch.Tensor) -> torch.Tensor:
@@ -586,8 +602,13 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.lane_embedding.weight, std=0.02)
         nn.init.normal_(self.line_type_embedding.weight, std=0.02)
-        nn.init.normal_(self.point_residual.weight, std=0.01)
+        nn.init.normal_(self.point_residual.weight, std=0.02)
         nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _apply(self, fn):
+        """Invalidate inference cache on device/dtype change."""
+        self._cached_pos = None
+        return super()._apply(fn)
 
     def _build_index_tables(self) -> None:
         lane_ids, line_type_ids, point_ids = [], [], []
@@ -630,7 +651,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
 
     def get_lane_mask(self) -> torch.Tensor:
         """Return boolean mask identifying lane queries vs other-line queries."""
-        return self.lane_mask
+        return self.lane_mask.clone()
 
 
 class HierarchicalLaneMapDecoder(nn.Module):
@@ -721,12 +742,13 @@ class HierarchicalLaneMapDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Query positional encoding projection (from 2D ref points to embed_dims)
+        # Query positional encoding projection with learnable gate
         self.query_pos_proj = nn.Sequential(
             nn.Linear(2, embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims, embed_dims),
         )
+        self.dynamic_pos_gate = nn.Parameter(torch.zeros(1))
 
         # BEV positional encoding
         self.bev_pos_enc = PositionalEncoding2D(embed_dims)
@@ -788,8 +810,8 @@ class HierarchicalLaneMapDecoder(nn.Module):
         for layer_idx, (decoder_layer, refine_mlp) in enumerate(
             zip(self.layers, self.refinement_mlps)
         ):
-            # Positional encoding from reference points + hierarchical structure
-            query_pos = self.query_pos_proj(reference_points) + hier_pos.unsqueeze(0)
+            # Gated dynamic position injection from reference points + hierarchical structure
+            query_pos = self.dynamic_pos_gate.sigmoid() * self.query_pos_proj(reference_points) + hier_pos.unsqueeze(0)
 
             # Apply decoder layer
             query = decoder_layer(

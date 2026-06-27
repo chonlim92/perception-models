@@ -1448,3 +1448,72 @@ encodings for 3D-to-2D correspondence.
 
 6. **End-to-end training:** No hand-crafted components (no anchors, no NMS, no
    depth estimation). Everything is learned through backpropagation.
+
+---
+
+## Hierarchical Lane Positional Embeddings (Enhancement)
+
+This model has been enhanced with topology-aware hierarchical lane positional embeddings for lane detection.
+
+### Architecture
+
+DETR3D's decoder already operates with 3D reference points that are iteratively refined via inverse-sigmoid addition. The hierarchical lane PE leverages this existing mechanism by injecting topology-aware positional information as a **gated dynamic position** derived from the 3D reference points of lane queries. Each lane query's reference point is projected through the hierarchical PE module, and the resulting embedding is combined with the query content via a learned gating mechanism. This allows the model to condition lane detection on both the geometric 3D position and the topological lane structure simultaneously, with iterative refinement operating in fp32 for numerical stability.
+
+### Key Components
+
+- `HierarchicalLanePositionalEmbedding` class: Generates topology-aware sinusoidal embeddings encoding lane index, boundary type, and point index. Maintains a `_pc_range` buffer (registered via `register_buffer`) matching the detection range [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] for coordinate normalization.
+- `LaneDetectionDecoderLayer` class: Extended DETR3D decoder layer that applies gated dynamic position injection. The gate is a sigmoid-activated linear projection of the concatenated query content and lane PE, controlling how much topological information flows into each query at each refinement step.
+
+### Implementation Details
+
+- Gated dynamic position injection from 3D reference points -- the lane PE is re-computed per decoder layer as reference points shift
+- Inverse-sigmoid iterative refinement in fp32 to prevent numerical issues at boundary values (reference points near 0 or 1)
+- `_pc_range` buffer registered for device-safe coordinate denormalization
+- Gate initialization biased toward 0.5 (equal blend of content and position) for stable early training
+- Per-layer refinement: `ref_new = sigmoid(inverse_sigmoid(ref_old) + delta)` computed in fp32, then cast back
+
+### Design Decisions
+
+- Balanced magnitude initialization (sinusoidal scaled to 0.02)
+- Dropout 0.05 (reduced for geometric tasks)
+- Inference caching with device-safe invalidation (_apply override)
+- get_lane_mask returns clone for safety
+
+### Query Layout
+
+```
+Total: 1000 queries (25 lanes x 2 lines x 20 points)
+[0-19]:    Lane 0, Left boundary, points 0-19
+[20-39]:   Lane 0, Right boundary, points 0-19
+[40-59]:   Lane 1, Left boundary, points 0-19
+...
+[980-999]: Lane 24, Right boundary, points 0-19
+```
+
+### Usage Example
+
+```python
+from models.lane_pe import HierarchicalLanePositionalEmbedding
+
+# Initialize with DETR3D's detection range
+lane_pe = HierarchicalLanePositionalEmbedding(
+    embed_dim=256,
+    num_lanes=25,
+    points_per_lane=20,
+    num_boundaries=2,
+    pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+)
+
+# In each decoder layer, inject gated position from 3D reference points
+ref_points_3d = lane_ref_points  # (B, 1000, 3) normalized [0,1]
+topo_pe = lane_pe()              # (1000, 256) static topology encoding
+
+# Gated fusion: gate = sigmoid(W_g * [query; topo_pe])
+gate = torch.sigmoid(gate_proj(torch.cat([lane_queries, topo_pe.expand_as(lane_queries)], dim=-1)))
+lane_queries = lane_queries + gate * topo_pe
+
+# Iterative refinement in fp32
+ref_logits = inverse_sigmoid(ref_points_3d.float())
+delta = refine_mlp(lane_queries)
+ref_points_3d = torch.sigmoid(ref_logits + delta).to(lane_queries.dtype)
+```

@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class HybridPointEmbedding(nn.Module):
@@ -23,12 +24,13 @@ class HybridPointEmbedding(nn.Module):
     to deviate from pure sinusoidal structure where needed.
     """
 
-    def __init__(self, num_points: int, embed_dim: int) -> None:
+    def __init__(self, num_points: int, embed_dim: int, sinusoidal_scale: float = 0.02) -> None:
         super().__init__()
+        assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
         self.num_points = num_points
         self.embed_dim = embed_dim
 
-        # Fixed sinusoidal base (encodes ordinal structure)
+        # Fixed sinusoidal base (encodes ordinal structure), scaled to match learned embeddings
         pe = torch.zeros(num_points, embed_dim)
         position = torch.arange(0, num_points, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
@@ -36,15 +38,13 @@ class HybridPointEmbedding(nn.Module):
             * (-math.log(10000.0) / embed_dim)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        if embed_dim % 2 == 0:
-            pe[:, 1::2] = torch.cos(position * div_term)
-        else:
-            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe * sinusoidal_scale
         self.register_buffer("sinusoidal_base", pe)
 
-        # Learned residual (initialized small so sinusoidal dominates early)
+        # Learned residual (same scale as sinusoidal for balanced gradient flow)
         self.residual = nn.Embedding(num_points, embed_dim)
-        nn.init.normal_(self.residual.weight, std=0.01)
+        nn.init.normal_(self.residual.weight, std=0.02)
 
     @property
     def weight(self) -> torch.Tensor:
@@ -142,9 +142,9 @@ def lane_width_consistency_loss(
     left = lane_pts[:, :, 0, :, :]  # (B, num_lanes, points_per_line, 2)
     right = lane_pts[:, :, 1, :, :]  # (B, num_lanes, points_per_line, 2)
 
-    # Width at each longitudinal station
-    widths = torch.norm(left - right, dim=-1)  # (B, num_lanes, points_per_line)
+    # Width at each longitudinal station (eps for gradient stability at zero)
+    widths = (left - right).pow(2).sum(-1).clamp(min=1e-6).sqrt()
 
-    # Penalize width variation along the lane (should be smooth)
+    # Penalize width variation (Smooth-L1 for outlier robustness at merges/splits)
     width_diff = widths[:, :, 1:] - widths[:, :, :-1]
-    return (width_diff ** 2).mean()
+    return F.smooth_l1_loss(width_diff, torch.zeros_like(width_diff), beta=0.01)
