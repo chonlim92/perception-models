@@ -111,7 +111,8 @@ fst-frontend/
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/nodes/:nodeId/metrics` | Get metrics summary |
-| POST | `/api/nodes/:nodeId/evaluate` | Run evaluation |
+| POST | `/api/nodes/:nodeId/evaluate` | Run evaluation scripts |
+| POST | `/api/nodes/:nodeId/results` | Submit results directly |
 | GET | `/api/nodes/:nodeId/kpi` | Get KPI config |
 | PUT | `/api/nodes/:nodeId/kpi` | Set KPI threshold |
 

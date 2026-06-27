@@ -177,6 +177,11 @@ curl -X PUT http://localhost:8000/api/nodes/L4.vehicle/kpi \
 # Get metrics summary
 curl http://localhost:8000/api/nodes/L4.vehicle/metrics
 
+# Submit evaluation results directly (from external evaluators)
+curl -X POST http://localhost:8000/api/nodes/L4.vehicle/results \
+  -H "Content-Type: application/json" \
+  -d '{"recording_id": "rec_001", "metrics": {"mAP": 0.72, "NDS": 0.68}}'
+
 # Add evaluation script
 curl -X POST http://localhost:8000/api/nodes/L4.vehicle/scripts \
   -H "Content-Type: application/json" \

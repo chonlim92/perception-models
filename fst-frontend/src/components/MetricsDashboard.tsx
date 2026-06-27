@@ -16,7 +16,7 @@ interface Props {
   metrics: MetricsSummary | undefined;
 }
 
-export function MetricsDashboard({ nodeId, metrics }: Props) {
+export function MetricsDashboard({ nodeId: _nodeId, metrics }: Props) {
   if (!metrics || !metrics.metrics || Object.keys(metrics.metrics).length === 0) {
     return (
       <div className="bg-gray-50 p-4 rounded-lg">

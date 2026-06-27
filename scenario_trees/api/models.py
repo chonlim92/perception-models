@@ -83,6 +83,7 @@ class AttachRecordingRequest(BaseModel):
     """Request to attach a recording to a node."""
     recording_id: str
     path: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
 
 
 class BulkImportRequest(BaseModel):
@@ -136,6 +137,12 @@ class RunEvaluationRequest(BaseModel):
     """Request to run evaluation on a node."""
     script_id: Optional[str] = None  # Run specific script, or all if None
     recording_ids: Optional[List[str]] = None  # Specific recordings, or all if None
+
+
+class SubmitResultsRequest(BaseModel):
+    """Request to submit evaluation results directly (from external evaluators)."""
+    recording_id: str
+    metrics: Dict[str, float]  # metric_name -> value
 
 
 class RootCauseAnalysisResponse(BaseModel):

@@ -79,6 +79,12 @@ requests.put(f"{BASE}/nodes/L4.vehicle/kpi", json={
     "direction": "above",
 })
 
+# Submit evaluation results from external evaluator
+requests.post(f"{BASE}/nodes/L4.vehicle/results", json={
+    "recording_id": "rec_001",
+    "metrics": {"mAP": 0.72, "NDS": 0.68}
+})
+
 # Trigger root cause analysis
 analysis = requests.post(f"{BASE}/nodes/L4.vehicle/analyze").json()
 print(analysis["patterns"])

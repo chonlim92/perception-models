@@ -80,7 +80,7 @@ function treeToFlow(
 }
 
 export function TreeVisualization() {
-  const { tree, selectNode, selectedNodeId } = useTreeStore();
+  const { tree, selectNode } = useTreeStore();
 
   const { initialNodes, initialEdges } = useMemo(() => {
     if (!tree) return { initialNodes: [], initialEdges: [] };

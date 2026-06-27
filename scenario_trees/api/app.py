@@ -29,6 +29,7 @@ from .models import (
     KPIConfigResponse,
     RunEvaluationRequest,
     SplitNodeRequest,
+    SubmitResultsRequest,
     UpdateNodeRequest,
 )
 
@@ -278,7 +279,18 @@ def get_node_recordings(node_id: str) -> List[Dict[str, Any]]:
 def attach_recording(node_id: str, request: AttachRecordingRequest) -> Dict[str, Any]:
     """Attach a recording to a node."""
     if request.path:
-        db.upsert_recording(request.recording_id, request.path)
+        db.upsert_recording(
+            recording_id=request.recording_id,
+            path=request.path,
+            attributes=request.attributes,
+        )
+    elif request.attributes:
+        rec = db.get_recording(request.recording_id)
+        db.upsert_recording(
+            recording_id=request.recording_id,
+            path=rec["path"] if rec else "",
+            attributes=request.attributes,
+        )
     db.attach_recording(node_id, request.recording_id)
     return {"status": "attached", "node_id": node_id, "recording_id": request.recording_id}
 
@@ -381,6 +393,24 @@ def run_evaluation(node_id: str, request: RunEvaluationRequest) -> Dict[str, Any
         "scripts_run": len(scripts),
         "recordings_evaluated": len(recordings),
         "results_count": results_count,
+    }
+
+
+@app.post("/api/nodes/{node_id}/results")
+def submit_results(node_id: str, request: SubmitResultsRequest) -> Dict[str, Any]:
+    """Submit evaluation results directly from an external evaluator."""
+    for metric_name, metric_value in request.metrics.items():
+        db.add_evaluation_result(
+            node_id=node_id,
+            recording_id=request.recording_id,
+            metric_name=metric_name,
+            metric_value=metric_value,
+        )
+    return {
+        "status": "results_stored",
+        "node_id": node_id,
+        "recording_id": request.recording_id,
+        "metrics_count": len(request.metrics),
     }
 
 
