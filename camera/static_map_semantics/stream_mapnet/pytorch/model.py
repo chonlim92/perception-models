@@ -870,6 +870,316 @@ class MapDecoder(nn.Module):
 
 
 # =============================================================================
+# Hierarchical Lane Positional Embeddings
+# =============================================================================
+
+
+class HierarchicalLanePositionalEmbedding(nn.Module):
+    """Hierarchical positional embeddings encoding lane -> line -> point structure.
+
+    Encodes the structural relationship between lanes, their boundary lines,
+    and individual points along each line. The final positional embedding for
+    each query is the sum of its lane-level, line-level, and point-level
+    embeddings, giving the transformer explicit awareness of the hierarchical
+    map topology.
+
+    Query layout (in order):
+        [0, num_lane_queries): Lane queries organized as
+            lane_0_left_pt0, ..., lane_0_left_pt19,
+            lane_0_right_pt0, ..., lane_0_right_pt19,
+            lane_1_left_pt0, ..., (num_lanes × 2 lines × points_per_line)
+        [num_lane_queries, total_queries): Other line queries organized as
+            line_0_pt0, ..., line_0_pt19,
+            line_1_pt0, ..., (num_other_lines × points_per_line)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+    ) -> None:
+        """Initialize hierarchical lane positional embeddings.
+
+        Args:
+            embed_dim: Embedding dimension (must match decoder d_model).
+            num_lanes: Number of lanes (each has left + right boundary).
+            points_per_line: Number of points sampled per line.
+            num_other_lines: Number of additional non-lane lines (e.g.,
+                road boundaries, crosswalks).
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+
+        self.num_lane_queries = num_lanes * 2 * points_per_line
+        self.num_other_queries = num_other_lines * points_per_line
+        self.total_queries = self.num_lane_queries + self.num_other_queries
+
+        # Lane-level embedding: which lane (0..num_lanes-1) or other-line group
+        self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
+
+        # Line-type embedding: 0=left boundary, 1=right boundary, 2=other
+        self.line_type_embedding = nn.Embedding(3, embed_dim)
+
+        # Point-position embedding: ordinal position along the line (0..points-1)
+        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+
+        # Learnable content queries (one per structural slot)
+        self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
+
+        self._init_weights()
+        self._build_index_tables()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.lane_embedding.weight, std=0.02)
+        nn.init.normal_(self.line_type_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _build_index_tables(self) -> None:
+        """Pre-compute index tensors for efficient lookup."""
+        lane_ids = []
+        line_type_ids = []
+        point_ids = []
+
+        # Lane queries: num_lanes × 2 lines × points_per_line
+        for lane_idx in range(self.num_lanes):
+            for line_type in range(2):  # 0=left, 1=right
+                for pt_idx in range(self.points_per_line):
+                    lane_ids.append(lane_idx)
+                    line_type_ids.append(line_type)
+                    point_ids.append(pt_idx)
+
+        # Other line queries
+        for line_idx in range(self.num_other_lines):
+            for pt_idx in range(self.points_per_line):
+                lane_ids.append(self.num_lanes + line_idx)
+                line_type_ids.append(2)  # type=other
+                point_ids.append(pt_idx)
+
+        self.register_buffer("lane_ids", torch.tensor(lane_ids, dtype=torch.long))
+        self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
+        self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute hierarchical positional and content embeddings.
+
+        Returns:
+            Tuple of:
+                - pos_embed: (total_queries, embed_dim) positional embeddings
+                - content_embed: (total_queries, embed_dim) content queries
+        """
+        pos_embed = (
+            self.lane_embedding(self.lane_ids)
+            + self.line_type_embedding(self.line_type_ids)
+            + self.point_embedding(self.point_ids)
+        )
+        content_embed = self.content_embedding.weight
+        return pos_embed, content_embed
+
+    def get_lane_mask(self) -> torch.Tensor:
+        """Return boolean mask identifying lane queries vs other-line queries.
+
+        Returns:
+            (total_queries,) boolean tensor, True for lane queries.
+        """
+        mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        mask[: self.num_lane_queries] = True
+        return mask
+
+
+class HierarchicalMapDecoder(nn.Module):
+    """Map decoder with hierarchical lane-structured positional embeddings.
+
+    Extends the standard MapDecoder by replacing flat query embeddings with
+    hierarchical positional embeddings that encode the lane -> line -> point
+    structure. This gives the transformer explicit knowledge of which query
+    corresponds to which point on which boundary line of which lane.
+
+    Output organization:
+        - 25 lanes × 2 boundary lines × 20 points = 1000 lane queries
+        - Additional non-lane polylines × 20 points each
+    """
+
+    def __init__(
+        self,
+        bev_channels: int = 256,
+        num_decoder_layers: int = 6,
+        d_model: int = 256,
+        num_heads: int = 8,
+        ffn_dim: int = 512,
+        dropout: float = 0.1,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+        auxiliary_loss: bool = True,
+    ):
+        """Initialize hierarchical map decoder.
+
+        Args:
+            bev_channels: Input BEV feature channels.
+            num_decoder_layers: Number of transformer decoder layers.
+            d_model: Model dimension.
+            num_heads: Number of attention heads.
+            ffn_dim: FFN hidden dimension.
+            dropout: Dropout rate.
+            num_lanes: Number of lanes (each with left+right boundary).
+            points_per_line: Points per line (default 20).
+            num_other_lines: Non-lane polylines.
+            auxiliary_loss: Whether to compute intermediate layer predictions.
+        """
+        super().__init__()
+        self.num_decoder_layers = num_decoder_layers
+        self.d_model = d_model
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+        self.auxiliary_loss = auxiliary_loss
+
+        # Hierarchical positional embeddings
+        self.hierarchical_pos = HierarchicalLanePositionalEmbedding(
+            embed_dim=d_model,
+            num_lanes=num_lanes,
+            points_per_line=points_per_line,
+            num_other_lines=num_other_lines,
+        )
+
+        self.total_queries = self.hierarchical_pos.total_queries
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+
+        # BEV feature projection
+        self.bev_proj = nn.Conv2d(bev_channels, d_model, kernel_size=1)
+
+        # Learnable BEV positional encoding
+        self.bev_pos_embed = None
+        self._bev_h = None
+        self._bev_w = None
+
+        # Decoder layers
+        self.layers = nn.ModuleList([
+            MapDecoderLayer(d_model, num_heads, ffn_dim, dropout)
+            for _ in range(num_decoder_layers)
+        ])
+        self.final_norm = nn.LayerNorm(d_model)
+
+        # Per-point 2D coordinate prediction
+        self.pts_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, 2),
+        )
+
+        # Per-line classification (lane exists or not)
+        # Classes: lane_divider, road_boundary, crosswalk, no-object
+        self.cls_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 4),
+        )
+
+    def _get_bev_pos(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Get or create BEV positional encoding."""
+        if self.bev_pos_embed is None or self._bev_h != H or self._bev_w != W:
+            self._bev_h = H
+            self._bev_w = W
+            self.bev_pos_embed = nn.Parameter(
+                torch.randn(1, H * W, self.d_model, device=device) * 0.02
+            )
+        return self.bev_pos_embed
+
+    def forward(
+        self, bev_features: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass through hierarchical map decoder.
+
+        Args:
+            bev_features: (B, C, H, W) BEV feature map.
+
+        Returns:
+            Dict with:
+                'pred_points': (B, num_total_lines, points_per_line, 2)
+                    predicted BEV coordinates per line
+                'pred_logits': (B, num_total_lines, 4) per-line class scores
+                'aux_outputs': list of intermediate predictions (if enabled)
+        """
+        B, C, H, W = bev_features.shape
+
+        # Project BEV features
+        bev_proj = self.bev_proj(bev_features)
+        memory = bev_proj.flatten(2).permute(0, 2, 1)  # (B, H*W, d_model)
+
+        # Add BEV positional encoding
+        bev_pos = self._get_bev_pos(H, W, bev_features.device)
+        memory = memory + bev_pos
+
+        # Get hierarchical query embeddings
+        query_pos, query_content = self.hierarchical_pos()
+
+        # Expand for batch and combine
+        queries = query_content.unsqueeze(0).expand(B, -1, -1)
+        queries = queries + query_pos.unsqueeze(0)
+
+        # Apply decoder layers
+        aux_outputs = []
+        for i, layer in enumerate(self.layers):
+            queries = layer(queries, memory)
+
+            if self.auxiliary_loss and i < self.num_decoder_layers - 1:
+                q_normed = self.final_norm(queries)
+                aux_pts, aux_cls = self._predict(q_normed, B)
+                aux_outputs.append({
+                    "pred_points": aux_pts,
+                    "pred_logits": aux_cls,
+                })
+
+        # Final predictions
+        queries = self.final_norm(queries)
+        pred_points, pred_logits = self._predict(queries, B)
+
+        outputs = {
+            "pred_points": pred_points,
+            "pred_logits": pred_logits,
+        }
+        if self.auxiliary_loss:
+            outputs["aux_outputs"] = aux_outputs
+
+        return outputs
+
+    def _predict(
+        self, queries: torch.Tensor, batch_size: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute point coordinates and line classifications.
+
+        Args:
+            queries: (B, total_queries, d_model) decoder output.
+            batch_size: Batch size.
+
+        Returns:
+            pred_points: (B, num_total_lines, points_per_line, 2)
+            pred_logits: (B, num_total_lines, 4)
+        """
+        # Per-point coordinates
+        raw_pts = self.pts_head(queries).sigmoid()  # (B, total_queries, 2)
+        pred_points = raw_pts.view(
+            batch_size, self.num_total_lines, self.points_per_line, 2
+        )
+
+        # Per-line classification: pool point features per line
+        line_features = queries.view(
+            batch_size, self.num_total_lines, self.points_per_line, self.d_model
+        ).mean(dim=2)  # (B, num_lines, d_model)
+
+        pred_logits = self.cls_head(line_features)  # (B, num_lines, 4)
+
+        return pred_points, pred_logits
+
+
+# =============================================================================
 # StreamMapNet: Full Model
 # =============================================================================
 

@@ -24,6 +24,8 @@ __all__ = [
     "BEVFormer",
     "BEVEncoder",
     "TransformerDecoder",
+    "HierarchicalLanePositionalEmbedding",
+    "LaneDetectionDecoder",
     "DetectionHead",
     "HungarianMatcher",
     "BEVFormerLoss",
@@ -482,6 +484,273 @@ class TransformerDecoder(nn.Module):
                 reference_points = new_reference.detach()
 
         return intermediate_outputs, reference_points
+
+
+# =============================================================================
+# Hierarchical Lane Positional Embeddings
+# =============================================================================
+
+
+class HierarchicalLanePositionalEmbedding(nn.Module):
+    """Hierarchical positional embeddings encoding lane -> line -> point structure.
+
+    Encodes the structural relationship between lanes, their boundary lines,
+    and individual points along each line. The final positional embedding for
+    each query is the sum of its lane-level, line-level, and point-level
+    embeddings, giving the transformer explicit awareness of the hierarchical
+    map topology.
+
+    Query layout (in order):
+        [0, num_lane_queries): Lane queries organized as
+            lane_0_left_pt0, ..., lane_0_left_pt19,
+            lane_0_right_pt0, ..., lane_0_right_pt19,
+            lane_1_left_pt0, ..., (25 lanes × 2 lines × 20 points = 1000)
+        [num_lane_queries, total_queries): Other line queries organized as
+            line_0_pt0, ..., line_0_pt19,
+            line_1_pt0, ..., (num_other_lines × 20 points)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+    ) -> None:
+        """Initialize hierarchical lane positional embeddings.
+
+        Args:
+            embed_dim: Embedding dimension (must match decoder d_model).
+            num_lanes: Number of lanes (each has left + right boundary).
+            points_per_line: Number of points sampled per line.
+            num_other_lines: Number of additional non-lane lines (e.g.,
+                road boundaries, crosswalks).
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+
+        self.num_lane_queries = num_lanes * 2 * points_per_line
+        self.num_other_queries = num_other_lines * points_per_line
+        self.total_queries = self.num_lane_queries + self.num_other_queries
+
+        # Lane-level embedding: which lane (0..num_lanes-1) or other-line group
+        self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
+
+        # Line-type embedding: 0=left boundary, 1=right boundary, 2=other
+        self.line_type_embedding = nn.Embedding(3, embed_dim)
+
+        # Point-position embedding: ordinal position along the line (0..19)
+        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+
+        # Learnable content queries (one per structural slot)
+        self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
+
+        self._init_weights()
+        self._build_index_tables()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.lane_embedding.weight, std=0.02)
+        nn.init.normal_(self.line_type_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _build_index_tables(self) -> None:
+        """Pre-compute index tensors for efficient lookup."""
+        lane_ids = []
+        line_type_ids = []
+        point_ids = []
+
+        # Lane queries: 25 lanes × 2 lines × 20 points
+        for lane_idx in range(self.num_lanes):
+            for line_type in range(2):  # 0=left, 1=right
+                for pt_idx in range(self.points_per_line):
+                    lane_ids.append(lane_idx)
+                    line_type_ids.append(line_type)
+                    point_ids.append(pt_idx)
+
+        # Other line queries
+        for line_idx in range(self.num_other_lines):
+            for pt_idx in range(self.points_per_line):
+                lane_ids.append(self.num_lanes + line_idx)
+                line_type_ids.append(2)  # type=other
+                point_ids.append(pt_idx)
+
+        self.register_buffer("lane_ids", torch.tensor(lane_ids, dtype=torch.long))
+        self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
+        self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute hierarchical positional and content embeddings.
+
+        Returns:
+            Tuple of:
+                - pos_embed: (total_queries, embed_dim) positional embeddings
+                - content_embed: (total_queries, embed_dim) content queries
+        """
+        pos_embed = (
+            self.lane_embedding(self.lane_ids)
+            + self.line_type_embedding(self.line_type_ids)
+            + self.point_embedding(self.point_ids)
+        )
+        content_embed = self.content_embedding.weight
+        return pos_embed, content_embed
+
+    def get_lane_mask(self) -> torch.Tensor:
+        """Return boolean mask identifying lane queries vs other-line queries.
+
+        Returns:
+            (total_queries,) boolean tensor, True for lane queries.
+        """
+        mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        mask[: self.num_lane_queries] = True
+        return mask
+
+
+class LaneDetectionDecoder(nn.Module):
+    """Transformer decoder with hierarchical lane-structured positional embeddings.
+
+    Designed for lane detection from BEV features. Each query corresponds to a
+    specific point on a specific line (left/right) of a specific lane, giving
+    the transformer explicit structural knowledge of the output topology.
+
+    Output organization:
+        - 25 lanes × 2 boundary lines × 20 points = 1000 lane queries
+        - Additional non-lane polylines × 20 points each
+    """
+
+    def __init__(
+        self,
+        num_decoder_layers: int = 6,
+        embed_dim: int = 256,
+        num_heads: int = 8,
+        ffn_dim: int = 2048,
+        dropout: float = 0.1,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+    ) -> None:
+        """Initialize lane detection decoder.
+
+        Args:
+            num_decoder_layers: Number of transformer decoder layers.
+            embed_dim: Feature dimension.
+            num_heads: Number of attention heads.
+            ffn_dim: FFN hidden dimension.
+            dropout: Dropout rate.
+            num_lanes: Number of lanes (each with left+right boundary).
+            points_per_line: Points sampled per line (default 20).
+            num_other_lines: Non-lane polylines (road edges, crosswalks).
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+
+        # Hierarchical positional embeddings
+        self.pos_embed = HierarchicalLanePositionalEmbedding(
+            embed_dim=embed_dim,
+            num_lanes=num_lanes,
+            points_per_line=points_per_line,
+            num_other_lines=num_other_lines,
+        )
+
+        self.total_queries = self.pos_embed.total_queries
+
+        # Decoder layers (reuse DecoderLayer from TransformerDecoder)
+        self.layers = nn.ModuleList([
+            DecoderLayer(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ffn_dim=ffn_dim,
+                dropout=dropout,
+            )
+            for _ in range(num_decoder_layers)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Per-point 2D coordinate regression (x, y in BEV)
+        self.point_reg_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, 2),
+        )
+
+        # Per-lane confidence (pooled over all points of a lane)
+        num_total_lines = num_lanes * 2 + num_other_lines
+        self.lane_cls_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.point_reg_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        for module in self.lane_cls_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self, bev_features: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass for lane detection.
+
+        Args:
+            bev_features: BEV features (B, bev_h*bev_w, embed_dim).
+
+        Returns:
+            Dict with:
+                'pred_points': (B, total_queries, 2) predicted BEV coordinates
+                'lane_logits': (B, num_total_lines) per-line confidence scores
+                'intermediate_points': list of (B, total_queries, 2) per layer
+        """
+        batch_size = bev_features.shape[0]
+
+        # Get hierarchical positional and content embeddings
+        query_pos, query_content = self.pos_embed()
+
+        # Expand for batch
+        query = query_content.unsqueeze(0).expand(batch_size, -1, -1)
+        query_pos_expanded = query_pos.unsqueeze(0).expand(batch_size, -1, -1)
+
+        intermediate_points = []
+
+        for layer in self.layers:
+            query = layer(query, bev_features, query_pos_expanded)
+            # Intermediate point predictions for auxiliary loss
+            pts = self.point_reg_head(self.norm(query)).sigmoid()
+            intermediate_points.append(pts)
+
+        # Final predictions
+        query = self.norm(query)
+        pred_points = self.point_reg_head(query).sigmoid()  # (B, Q, 2)
+
+        # Per-line confidence: pool points belonging to each line
+        num_total_lines = self.num_lanes * 2 + self.num_other_lines
+        line_features = pred_points.new_zeros(batch_size, num_total_lines, self.embed_dim)
+
+        for line_idx in range(num_total_lines):
+            start = line_idx * self.points_per_line
+            end = start + self.points_per_line
+            line_features[:, line_idx] = query[:, start:end].mean(dim=1)
+
+        lane_logits = self.lane_cls_head(line_features).squeeze(-1)  # (B, num_lines)
+
+        return {
+            "pred_points": pred_points,
+            "lane_logits": lane_logits,
+            "intermediate_points": intermediate_points,
+        }
 
 
 # =============================================================================
