@@ -324,6 +324,7 @@ class DecoderLayer(nn.Module):
         query: torch.Tensor,
         bev_features: torch.Tensor,
         query_pos: torch.Tensor,
+        self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -331,6 +332,7 @@ class DecoderLayer(nn.Module):
             query: Object queries (B, num_queries, embed_dim).
             bev_features: BEV features (B, bev_h*bev_w, embed_dim).
             query_pos: Positional embeddings for queries (B, num_queries, embed_dim).
+            self_attn_mask: Additive float mask (Q, Q) for self-attention. -inf blocks.
 
         Returns:
             Updated queries (B, num_queries, embed_dim).
@@ -338,7 +340,7 @@ class DecoderLayer(nn.Module):
         # Self-attention
         q = k = query + query_pos
         residual = query
-        query_out, _ = self.self_attn(q, k, query)
+        query_out, _ = self.self_attn(q, k, query, attn_mask=self_attn_mask)
         query = residual + self.self_attn_dropout(query_out)
         query = self.self_attn_norm(query)
 
@@ -516,6 +518,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
+        pos_drop: float = 0.1,
     ) -> None:
         """Initialize hierarchical lane positional embeddings.
 
@@ -525,6 +528,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
             points_per_line: Number of points sampled per line.
             num_other_lines: Number of additional non-lane lines (e.g.,
                 road boundaries, crosswalks).
+            pos_drop: Dropout rate on summed positional embedding.
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -549,6 +553,11 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         # Learnable content queries (one per structural slot)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
+        # LayerNorm stabilizes the summed positional embedding
+        self.pos_layer_norm = nn.LayerNorm(embed_dim)
+        self.pos_dropout = nn.Dropout(pos_drop)
+
+        self._cached_pos: Optional[torch.Tensor] = None
         self._init_weights()
         self._build_index_tables()
 
@@ -583,6 +592,11 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
         self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
 
+        # Pre-compute lane_mask as buffer (avoids per-call allocation)
+        lane_mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        lane_mask[: self.num_lane_queries] = True
+        self.register_buffer("lane_mask", lane_mask)
+
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute hierarchical positional and content embeddings.
 
@@ -591,25 +605,25 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
                 - pos_embed: (total_queries, embed_dim) positional embeddings
                 - content_embed: (total_queries, embed_dim) content queries
         """
+        if not self.training and self._cached_pos is not None:
+            return self._cached_pos, self.content_embedding.weight
+
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
             + self.point_embedding(self.point_ids)
         )
+        pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
+
+        if not self.training:
+            self._cached_pos = pos_embed
+
         content_embed = self.content_embedding.weight
         return pos_embed, content_embed
 
     def get_lane_mask(self) -> torch.Tensor:
-        """Return boolean mask identifying lane queries vs other-line queries.
-
-        Returns:
-            (total_queries,) boolean tensor, True for lane queries.
-        """
-        mask = torch.zeros(
-            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
-        )
-        mask[: self.num_lane_queries] = True
-        return mask
+        """Return boolean mask identifying lane queries vs other-line queries."""
+        return self.lane_mask
 
 
 class LaneDetectionDecoder(nn.Module):
@@ -703,6 +717,20 @@ class LaneDetectionDecoder(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    def _build_decoupled_self_attn_mask(self) -> torch.Tensor:
+        """Build block-diagonal self-attention mask (decoupled attention).
+
+        Points on the same line can attend to each other but not to other lines.
+        """
+        num_total_lines = self.num_lanes * 2 + self.num_other_lines
+        total_q = num_total_lines * self.points_per_line
+        mask = torch.full((total_q, total_q), float("-inf"))
+        for line_idx in range(num_total_lines):
+            start = line_idx * self.points_per_line
+            end = start + self.points_per_line
+            mask[start:end, start:end] = 0.0
+        return mask
+
     def forward(
         self, bev_features: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
@@ -726,10 +754,18 @@ class LaneDetectionDecoder(nn.Module):
         query = query_content.unsqueeze(0).expand(batch_size, -1, -1)
         query_pos_expanded = query_pos.unsqueeze(0).expand(batch_size, -1, -1)
 
+        # Build decoupled self-attention mask
+        self_attn_mask = self._build_decoupled_self_attn_mask().to(
+            device=query.device
+        )
+
         intermediate_points = []
 
         for layer in self.layers:
-            query = layer(query, bev_features, query_pos_expanded)
+            query = layer(
+                query, bev_features, query_pos_expanded,
+                self_attn_mask=self_attn_mask,
+            )
             # Intermediate point predictions for auxiliary loss
             pts = self.point_reg_head(self.norm(query)).sigmoid()
             intermediate_points.append(pts)

@@ -415,6 +415,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
+        pos_drop: float = 0.1,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -432,6 +433,10 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.point_embedding = nn.Embedding(points_per_line, embed_dim)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
+        self.pos_layer_norm = nn.LayerNorm(embed_dim)
+        self.pos_dropout = nn.Dropout(pos_drop)
+
+        self._cached_pos: Optional[torch.Tensor] = None
         self._init_weights()
         self._build_index_tables()
 
@@ -459,22 +464,30 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
         self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
 
+        lane_mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        lane_mask[: self.num_lane_queries] = True
+        self.register_buffer("lane_mask", lane_mask)
+
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (pos_embed, content_embed) each (total_queries, embed_dim)."""
+        if not self.training and self._cached_pos is not None:
+            return self._cached_pos, self.content_embedding.weight
+
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
             + self.point_embedding(self.point_ids)
         )
+        pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
+
+        if not self.training:
+            self._cached_pos = pos_embed
+
         return pos_embed, self.content_embedding.weight
 
     def get_lane_mask(self) -> torch.Tensor:
         """Return boolean mask identifying lane queries vs other-line queries."""
-        mask = torch.zeros(
-            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
-        )
-        mask[: self.num_lane_queries] = True
-        return mask
+        return self.lane_mask
 
 
 class PETRLaneDecoder(nn.Module):
@@ -543,6 +556,13 @@ class PETRLaneDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
+        # Dynamic position injection: project reference points to query_pos space
+        self.query_pos_proj = nn.Sequential(
+            nn.Linear(3, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+        )
+
         # 3D reference points (lanes are ground-plane structures)
         self.reference_points_proj = nn.Linear(embed_dims, 3)
 
@@ -567,6 +587,20 @@ class PETRLaneDecoder(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.zeros_(m.bias)
+        for m in self.query_pos_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def _build_decoupled_self_attn_mask(self) -> torch.Tensor:
+        """Build block-diagonal self-attention mask for lane-structured queries."""
+        total_q = self.total_queries
+        mask = torch.full((total_q, total_q), float("-inf"))
+        for line_idx in range(self.num_total_lines):
+            start = line_idx * self.points_per_line
+            end = start + self.points_per_line
+            mask[start:end, start:end] = 0.0
+        return mask
 
     def forward(
         self,
@@ -596,33 +630,40 @@ class PETRLaneDecoder(nn.Module):
 
         # Initialize queries and positional embeddings
         query = hier_content.unsqueeze(0).expand(batch_size, -1, -1)
-        query_pos = hier_pos.unsqueeze(0).expand(batch_size, -1, -1)
+        query_pos_static = hier_pos.unsqueeze(0).expand(batch_size, -1, -1)
 
         # Initialize 3D reference points
         combined = hier_content + hier_pos
         reference_points = self.reference_points_proj(combined).sigmoid()
         reference_points = reference_points.unsqueeze(0).expand(batch_size, -1, -1)
 
+        # Decoupled self-attention mask
+        self_attn_mask = self._build_decoupled_self_attn_mask().to(
+            device=query.device
+        )
+
         intermediate_outputs = []
         intermediate_ref_pts = []
 
         for layer_idx, layer in enumerate(self.layers):
+            # Dynamic position injection: combine static hierarchy with ref-point signal
+            query_pos = query_pos_static + self.query_pos_proj(reference_points)
+
             query = layer(
                 query=query,
                 key=key,
                 value=value,
                 query_pos=query_pos,
                 key_pos=key_pos,
+                self_attn_mask=self_attn_mask,
                 key_padding_mask=key_padding_mask,
             )
 
-            # Iterative refinement in inverse-sigmoid (logit) space
+            # Iterative refinement in inverse-sigmoid (logit) space, fp32 for safety
             ref_delta = self.reg_branches[layer_idx](query)
-            inv_ref = torch.log(
-                reference_points.clamp(1e-5, 1 - 1e-5)
-                / (1 - reference_points.clamp(1e-5, 1 - 1e-5))
-            )
-            new_ref_pts = (inv_ref + ref_delta).sigmoid()
+            ref_f32 = reference_points.float().clamp(1e-3, 1 - 1e-3)
+            inv_ref = torch.log(ref_f32 / (1 - ref_f32))
+            new_ref_pts = (inv_ref + ref_delta.float()).sigmoid().to(query.dtype)
             reference_points = new_ref_pts.detach()
 
             if self.return_intermediate:

@@ -186,6 +186,7 @@ class DETR3DTransformerDecoderLayer(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
         image_shape: Tuple[int, int],
+        self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -196,13 +197,14 @@ class DETR3DTransformerDecoderLayer(nn.Module):
             intrinsics: Camera intrinsics, shape (B, num_cams, 3, 3).
             extrinsics: Camera extrinsics, shape (B, num_cams, 4, 4).
             image_shape: (H, W) of input images.
+            self_attn_mask: Additive float mask (Q, Q) for decoupled self-attention.
 
         Returns:
             Updated query features, shape (B, N, embed_dims).
         """
         # 1. Self-attention with residual and LayerNorm
         q = k = query + query_pos
-        self_attn_out, _ = self.self_attn(q, k, query)
+        self_attn_out, _ = self.self_attn(q, k, query, attn_mask=self_attn_mask)
         query = query + self.self_attn_dropout(self_attn_out)
         query = self.self_attn_norm(query)
 
@@ -419,6 +421,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
+        pos_drop: float = 0.1,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -436,6 +439,10 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.point_embedding = nn.Embedding(points_per_line, embed_dim)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
+        self.pos_layer_norm = nn.LayerNorm(embed_dim)
+        self.pos_dropout = nn.Dropout(pos_drop)
+
+        self._cached_pos: Optional[torch.Tensor] = None
         self._init_weights()
         self._build_index_tables()
 
@@ -463,22 +470,30 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
         self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
 
+        lane_mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        lane_mask[: self.num_lane_queries] = True
+        self.register_buffer("lane_mask", lane_mask)
+
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (pos_embed, content_embed) each (total_queries, embed_dim)."""
+        if not self.training and self._cached_pos is not None:
+            return self._cached_pos, self.content_embedding.weight
+
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
             + self.point_embedding(self.point_ids)
         )
+        pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
+
+        if not self.training:
+            self._cached_pos = pos_embed
+
         return pos_embed, self.content_embedding.weight
 
     def get_lane_mask(self) -> torch.Tensor:
         """Return boolean mask identifying lane queries vs other-line queries."""
-        mask = torch.zeros(
-            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
-        )
-        mask[: self.num_lane_queries] = True
-        return mask
+        return self.lane_mask
 
 
 class DETR3DLaneDecoder(nn.Module):
@@ -551,6 +566,13 @@ class DETR3DLaneDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
+        # Dynamic position injection: project reference points to query_pos space
+        self.query_pos_proj = nn.Sequential(
+            nn.Linear(3, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+        )
+
         # 3D reference points for lane points (lanes are on the ground plane)
         self.reference_points_embed = nn.Linear(embed_dims, 3)
 
@@ -574,6 +596,20 @@ class DETR3DLaneDecoder(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.constant_(m.bias, 0)
+        for m in self.query_pos_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def _build_decoupled_self_attn_mask(self) -> torch.Tensor:
+        """Build block-diagonal self-attention mask for lane-structured queries."""
+        total_q = self.total_queries
+        mask = torch.full((total_q, total_q), float("-inf"))
+        for line_idx in range(self.num_total_lines):
+            start = line_idx * self.points_per_line
+            end = start + self.points_per_line
+            mask[start:end, start:end] = 0.0
+        return mask
 
     def forward(
         self,
@@ -602,18 +638,26 @@ class DETR3DLaneDecoder(nn.Module):
 
         # Initialize queries and positional embeddings
         query = hier_content.unsqueeze(0).expand(batch_size, -1, -1)
-        query_pos = hier_pos.unsqueeze(0).expand(batch_size, -1, -1)
+        query_pos_static = hier_pos.unsqueeze(0).expand(batch_size, -1, -1)
 
         # Initialize 3D reference points from combined embeddings
         combined = hier_content + hier_pos
         reference_points = self.reference_points_embed(combined).sigmoid()
         reference_points = reference_points.unsqueeze(0).expand(batch_size, -1, -1)
 
+        # Decoupled self-attention mask
+        self_attn_mask = self._build_decoupled_self_attn_mask().to(
+            device=query.device
+        )
+
         intermediate_outputs = []
         intermediate_ref_points = []
 
         for layer_idx, layer in enumerate(self.layers):
             ref_points_3d = self._denormalize_reference_points(reference_points)
+
+            # Dynamic position injection: combine static hierarchy with ref-point signal
+            query_pos = query_pos_static + self.query_pos_proj(reference_points)
 
             query = layer(
                 query=query,
@@ -623,9 +667,10 @@ class DETR3DLaneDecoder(nn.Module):
                 intrinsics=intrinsics,
                 extrinsics=extrinsics,
                 image_shape=image_shape,
+                self_attn_mask=self_attn_mask,
             )
 
-            # Refine reference points
+            # Refine reference points in logit-space for fp16 safety
             ref_delta = self.ref_point_heads[layer_idx](query)
             new_ref_points = torch.sigmoid(
                 self._inverse_sigmoid(reference_points) + ref_delta
@@ -642,6 +687,7 @@ class DETR3DLaneDecoder(nn.Module):
         return ref_points * (pc_range[3:] - pc_range[:3]) + pc_range[:3]
 
     @staticmethod
-    def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-        x = x.clamp(min=eps, max=1 - eps)
+    def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+        # Compute in fp32 for mixed-precision safety (1-eps must be < 1.0 in fp16)
+        x = x.float().clamp(min=eps, max=1 - eps)
         return torch.log(x / (1 - x))

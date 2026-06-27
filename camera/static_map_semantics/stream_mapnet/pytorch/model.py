@@ -899,6 +899,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
+        pos_drop: float = 0.1,
     ) -> None:
         """Initialize hierarchical lane positional embeddings.
 
@@ -908,6 +909,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
             points_per_line: Number of points sampled per line.
             num_other_lines: Number of additional non-lane lines (e.g.,
                 road boundaries, crosswalks).
+            pos_drop: Dropout rate on summed positional embedding.
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -932,6 +934,11 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         # Learnable content queries (one per structural slot)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
+        # LayerNorm stabilizes the summed positional embedding
+        self.pos_layer_norm = nn.LayerNorm(embed_dim)
+        self.pos_dropout = nn.Dropout(pos_drop)
+
+        self._cached_pos: Optional[torch.Tensor] = None
         self._init_weights()
         self._build_index_tables()
 
@@ -966,6 +973,10 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
         self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
 
+        lane_mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        lane_mask[: self.num_lane_queries] = True
+        self.register_buffer("lane_mask", lane_mask)
+
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute hierarchical positional and content embeddings.
 
@@ -974,25 +985,25 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
                 - pos_embed: (total_queries, embed_dim) positional embeddings
                 - content_embed: (total_queries, embed_dim) content queries
         """
+        if not self.training and self._cached_pos is not None:
+            return self._cached_pos, self.content_embedding.weight
+
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
             + self.point_embedding(self.point_ids)
         )
+        pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
+
+        if not self.training:
+            self._cached_pos = pos_embed
+
         content_embed = self.content_embedding.weight
         return pos_embed, content_embed
 
     def get_lane_mask(self) -> torch.Tensor:
-        """Return boolean mask identifying lane queries vs other-line queries.
-
-        Returns:
-            (total_queries,) boolean tensor, True for lane queries.
-        """
-        mask = torch.zeros(
-            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
-        )
-        mask[: self.num_lane_queries] = True
-        return mask
+        """Return boolean mask identifying lane queries vs other-line queries."""
+        return self.lane_mask
 
 
 class HierarchicalMapDecoder(nn.Module):
@@ -1095,10 +1106,12 @@ class HierarchicalMapDecoder(nn.Module):
         """Get BEV positional encoding, interpolating if spatial size changed."""
         if H == self._bev_h and W == self._bev_w:
             return self.bev_pos_embed
-        pos = self.bev_pos_embed.view(1, self._bev_h, self._bev_w, self.d_model)
+        # Interpolate in fp32 for numerical precision on fp16 hardware
+        pos = self.bev_pos_embed.float().view(1, self._bev_h, self._bev_w, self.d_model)
         pos = pos.permute(0, 3, 1, 2)
         pos = F.interpolate(pos, size=(H, W), mode="bilinear", align_corners=False)
-        return pos.permute(0, 2, 3, 1).reshape(1, H * W, self.d_model)
+        pos = pos.permute(0, 2, 3, 1).reshape(1, H * W, self.d_model)
+        return pos.to(self.bev_pos_embed.dtype)
 
     def forward(
         self, bev_features: torch.Tensor
@@ -1128,14 +1141,14 @@ class HierarchicalMapDecoder(nn.Module):
         # Get hierarchical query embeddings
         query_pos, query_content = self.hierarchical_pos()
 
-        # Expand for batch and combine
+        # Expand for batch (positional embedding injected per-layer, not once)
         queries = query_content.unsqueeze(0).expand(B, -1, -1)
-        queries = queries + query_pos.unsqueeze(0)
+        query_pos_expanded = query_pos.unsqueeze(0).expand(B, -1, -1)
 
-        # Apply decoder layers
+        # Apply decoder layers with per-layer position injection
         aux_outputs = []
         for i, layer in enumerate(self.layers):
-            queries = layer(queries, memory)
+            queries = layer(queries + query_pos_expanded, memory)
 
             if self.auxiliary_loss and i < self.num_decoder_layers - 1:
                 q_normed = self.final_norm(queries)

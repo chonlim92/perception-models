@@ -528,6 +528,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         num_lanes: int = 25,
         points_per_line: int = 20,
         num_other_lines: int = 0,
+        pos_drop: float = 0.1,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -549,6 +550,10 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         # Content queries (one per structural slot)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
+        self.pos_layer_norm = nn.LayerNorm(embed_dim)
+        self.pos_dropout = nn.Dropout(pos_drop)
+
+        self._cached_pos: Optional[torch.Tensor] = None
         self._init_weights()
         self._build_index_tables()
 
@@ -576,22 +581,30 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
         self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
 
+        lane_mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        lane_mask[: self.num_lane_queries] = True
+        self.register_buffer("lane_mask", lane_mask)
+
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (positional_embedding, content_embedding) each (total_queries, embed_dim)."""
+        if not self.training and self._cached_pos is not None:
+            return self._cached_pos, self.content_embedding.weight
+
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
             + self.point_embedding(self.point_ids)
         )
+        pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
+
+        if not self.training:
+            self._cached_pos = pos_embed
+
         return pos_embed, self.content_embedding.weight
 
     def get_lane_mask(self) -> torch.Tensor:
         """Return boolean mask identifying lane queries vs other-line queries."""
-        mask = torch.zeros(
-            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
-        )
-        mask[: self.num_lane_queries] = True
-        return mask
+        return self.lane_mask
 
 
 class HierarchicalLaneMapDecoder(nn.Module):
@@ -762,11 +775,12 @@ class HierarchicalLaneMapDecoder(nn.Module):
                 num_points=self.points_per_line,
             )
 
-            # Iterative refinement
+            # Iterative refinement (computed in fp32 for numerical stability)
             delta = refine_mlp(query)
+            ref_f32 = reference_points.float().clamp(1e-3, 1 - 1e-3)
             new_ref_pts = (
-                torch.special.logit(reference_points.clamp(1e-5, 1 - 1e-5)) + delta
-            ).sigmoid()
+                torch.special.logit(ref_f32) + delta.float()
+            ).sigmoid().to(query.dtype)
             reference_points = new_ref_pts.detach()
 
             # Store intermediate results
