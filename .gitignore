@@ -43,6 +43,13 @@ runs/
 .DS_Store
 Thumbs.db
 
+# Node.js
+node_modules/
+package-lock.json
+
+# SQLite
+*.db
+
 # Temp
 *.tmp
 inference_results/
