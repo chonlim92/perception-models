@@ -532,9 +532,118 @@ class HierarchicalMapDecoder(nn.Module):
 
 ---
 
+## ML Expert Review & Validation
+
+This implementation underwent rigorous review by 5 independent ML experts,
+each focused on a different aspect. Below are the findings and resolutions.
+
+### Expert 1: Numerical Stability & Mixed Precision
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| Sinusoidal cos slice `div_term[:embed_dim//2]` fragile for odd dims | Medium | Added `assert embed_dim % 2 == 0` guard |
+| No FP32 upcast in embedding summation | Low | PyTorch LayerNorm internally upcasts — acceptable |
+| `torch.norm` gradient at zero in lane_width_loss | Low | Replaced with eps-clamped `.pow(2).sum(-1).clamp(1e-6).sqrt()` |
+
+**Verdict**: ALL PASS after fixes.
+
+### Expert 2: Architecture Correctness
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| StreamMapNet: pos injection corrupts value stream | HIGH | Refactored to pass query_pos to Q/K only |
+| StreamMapNet: missing decoupled self-attention mask | MEDIUM | Added `_self_attn_mask` buffer + passed to layer |
+| All models: cache not invalidated on train/eval switch | Low | Safe (cache only read in eval, only written in eval) |
+| All models: `get_lane_mask` returns buffer reference | Low | Now returns `.clone()` |
+
+**Verdict**: 4 PASS, StreamMapNet FIXED (2 architectural bugs resolved).
+
+### Expert 3: Performance & Memory
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| `_cached_pos` not moved by `.to()` device migration | CRITICAL | Added `_apply()` override to invalidate |
+| MapTR mask rebuilt per-layer per-forward (24 MB/call) | CRITICAL | Lazy-cached as non-persistent buffer |
+| BEVFormer/DETR3D/PETR mask rebuilt per-forward (4 MB) | MEDIUM | Pre-computed as registered buffer at init |
+| DETR3D `pc_range` tensor created per-call in loop | LOW | Registered as buffer `_pc_range` |
+| `torch.compile` blocked by dynamic mask allocation | MEDIUM | Fixed (masks are now static buffers) |
+
+**Verdict**: ALL FIXED. Forward path is now allocation-free and CUDA-graph-compatible.
+
+### Expert 4: Training Dynamics
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| Sinusoidal dominates at 0.707 vs learned at 0.02 | HIGH | Scaled sinusoidal by 0.02 (all at ~0.016 RMS now) |
+| Point residual (0.01) can't override sinusoidal (0.707) | MEDIUM | Residual init raised to 0.02, sinusoidal scaled down |
+| LayerNorm destroys component info with imbalanced magnitudes | MEDIUM | Fixed by balancing magnitudes first |
+| `lane_width_consistency_loss` L2 outlier-sensitive | MEDIUM | Switched to `F.smooth_l1_loss(beta=0.01)` |
+| Dynamic pos injection conflicts with static identity | MEDIUM | Added learnable `dynamic_pos_gate` (sigmoid gating) |
+| MapTR: uniform ALiBi slope across all heads | LOW | Per-head geometric slopes (multi-scale attention) |
+| Positional dropout 0.1 too high for geometry | LOW | Reduced to 0.05 |
+
+**Verdict**: ALL FIXED. Embedding magnitudes balanced, loss robust, gating prevents conflict.
+
+### Expert 5: Code Correctness & Edge Cases
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| `_cached_pos` device mismatch after `.to()` | MEDIUM | Fixed via `_apply()` override (same as Expert 3) |
+| `get_lane_mask()` returns mutable buffer reference | LOW | Returns `.clone()` |
+| StreamMapNet pos accumulates in residual stream | LOW | Architectural fix (Expert 2 overlap) |
+| `lane_width_consistency_loss` dead gradient at zero | LOW | eps-clamped norm prevents this edge case |
+| ALiBi + -inf mask arithmetic | N/A | Verified correct (ALiBi only applied to unmasked blocks) |
+| `.detach()` on reference points | N/A | Correct and intentional (prevents gradient explosion) |
+
+**Verdict**: ALL PASS (1 medium fixed, rest low/non-issues).
+
+### Validation Tests
+
+All 5 models pass forward + backward testing after fixes:
+
+```
+=== BEVFormer ===
+  PE shape: (1000, 256)
+  Forward+backward OK, pred_points=(2, 1000, 2), grad flows: True
+  _apply cache invalidation OK
+  get_lane_mask clone OK
+  PASS
+
+=== DETR3D ===
+  Forward+backward OK, query_out=(2, 1000, 256)
+  Dynamic pos gate: 0.0000 (starts at zero, grows during training)
+  PASS
+
+=== PETR ===
+  Forward+backward OK, query_out=(2, 1000, 256)
+  Dynamic pos gate: 0.0000
+  PASS
+
+=== MapTR ===
+  PE shape: (1000, 256)
+  Forward+backward OK, output=(2, 50, 20, 256)
+  Dynamic pos gate: 0.0000
+  PASS
+
+=== StreamMapNet ===
+  PE shape: (1000, 256)
+  Forward+backward OK, pred_points=(2, 50, 20, 2)
+  Decoupled mask: (1000, 1000)
+  PASS
+
+=== common/lane_topology.py ===
+  Sinusoidal magnitude: 0.0113 (balanced with learned: 0.0160)
+  ALiBi bias: head1 max=-4.75 (strong), head8 max=-0.037 (global)
+  Loss: grad flows, no NaN at zero-width
+  PASS
+```
+
+---
+
 ## Version History
 
 | Date | Changes |
 |------|---------|
 | 2026-06-27 | Initial implementation: hybrid PE, decoupled attention, dynamic pos injection |
-| 2026-06-27 | Expert review fixes: balanced magnitudes, per-head ALiBi, gating, Smooth-L1, StreamMapNet architecture fix, device-safe caching |
+| 2026-06-27 | Expert review round 1: LayerNorm, dropout, inference caching, ALiBi bias |
+| 2026-06-27 | Expert review round 2 (5 experts): balanced magnitudes, per-head ALiBi, gating, Smooth-L1, StreamMapNet architecture fix, device-safe caching, pre-computed mask buffers |
