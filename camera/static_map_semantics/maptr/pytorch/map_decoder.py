@@ -178,11 +178,11 @@ class MapDecoderLayer(nn.Module):
     def _build_self_attn_mask(
         self, num_queries: int, num_points: int, device: torch.device
     ) -> Optional[torch.Tensor]:
-        """Build self-attention mask for decoupled attention (MapTRv2).
+        """Build self-attention mask for decoupled attention (MapTRv2) + ALiBi bias.
 
         In decoupled mode, point queries within the same instance can attend
-        to each other, but not to points from other instances. Instance-level
-        information is shared via the iterative refinement mechanism instead.
+        to each other, but not to points from other instances. An ALiBi-style
+        distance-based bias within each block encourages local smoothness.
 
         Args:
             num_queries: Number of instance queries.
@@ -191,8 +191,7 @@ class MapDecoderLayer(nn.Module):
 
         Returns:
             Attention mask of shape [num_queries*num_points, num_queries*num_points]
-            where True means "do NOT attend" (additive -inf mask convention for
-            nn.MultiheadAttention), or None if no masking.
+            where -inf means "do NOT attend" and negative values encode distance bias.
         """
         if self.self_attn_mask_type == "none":
             return None
@@ -209,6 +208,18 @@ class MapDecoderLayer(nn.Module):
         # Convert bool mask to float mask: True -> -inf, False -> 0
         float_mask = torch.zeros(total, total, dtype=torch.float32, device=device)
         float_mask.masked_fill_(mask, float("-inf"))
+
+        # Add ALiBi intra-line distance bias (soft locality prior)
+        point_dists = torch.abs(
+            torch.arange(num_points, dtype=torch.float32, device=device).unsqueeze(0)
+            - torch.arange(num_points, dtype=torch.float32, device=device).unsqueeze(1)
+        )
+        alibi_slope = 0.1
+        for i in range(num_queries):
+            start = i * num_points
+            end = start + num_points
+            float_mask[start:end, start:end] -= alibi_slope * point_dists
+
         return float_mask
 
     def forward(
@@ -545,8 +556,9 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
         # Line-type embedding: 0=left boundary, 1=right boundary, 2=other
         self.line_type_embedding = nn.Embedding(3, embed_dim)
-        # Point-position embedding: ordinal position along the line
-        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+        # Point-position embedding: hybrid sinusoidal + learned for ordinal prior
+        self._build_sinusoidal_base(points_per_line, embed_dim)
+        self.point_residual = nn.Embedding(points_per_line, embed_dim)
         # Content queries (one per structural slot)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
@@ -557,10 +569,24 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self._init_weights()
         self._build_index_tables()
 
+    def _build_sinusoidal_base(self, num_points: int, embed_dim: int) -> None:
+        pe = torch.zeros(num_points, embed_dim)
+        position = torch.arange(0, num_points, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embed_dim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / embed_dim)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        self.register_buffer("point_sinusoidal", pe)
+
+    def _point_embedding(self, point_ids: torch.Tensor) -> torch.Tensor:
+        return self.point_sinusoidal[point_ids] + self.point_residual(point_ids)
+
     def _init_weights(self) -> None:
         nn.init.normal_(self.lane_embedding.weight, std=0.02)
         nn.init.normal_(self.line_type_embedding.weight, std=0.02)
-        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_residual.weight, std=0.01)
         nn.init.normal_(self.content_embedding.weight, std=0.02)
 
     def _build_index_tables(self) -> None:
@@ -593,7 +619,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
-            + self.point_embedding(self.point_ids)
+            + self._point_embedding(self.point_ids)
         )
         pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
 

@@ -1,0 +1,54 @@
+# HDMapNet configuration for nuScenes dataset
+# Reference: HDMapNet: An Online HD Map Construction and Evaluation Framework (ICRA 2022)
+
+# Data
+dataroot: /data/nuscenes
+train_ann_file: /data/nuscenes/annotations/hdmap_train.json
+val_ann_file: /data/nuscenes/annotations/hdmap_val.json
+image_size: [128, 352]
+xbound: [-30.0, 30.0, 0.3]
+ybound: [-15.0, 15.0, 0.3]
+zbound: [-10.0, 10.0, 20.0]
+dbound: [4.0, 45.0, 1.0]
+num_classes: 3  # lane_divider, road_boundary, pedestrian_crossing
+thickness: 5
+
+# Model
+backbone: efficientnet-b0
+pretrained_backbone: true
+backbone_out_channels: 64
+view_transform: lss  # Lift-Splat-Shoot
+embedding_dim: 16
+bev_encoder_base_channels: 64
+head_mid_channels: 64
+
+# Training
+epochs: 30
+batch_size: 4
+num_workers: 4
+lr: 2.0e-4
+weight_decay: 1.0e-4
+warmup_epochs: 1
+grad_accumulation_steps: 1
+clip_grad_norm: 5.0
+
+# Loss weights
+semantic_weight: 1.0
+instance_weight: 1.0
+direction_weight: 0.2
+use_focal: true
+focal_alpha: 0.25
+focal_gamma: 2.0
+delta_v: 0.5  # Discriminative loss: pull force margin
+delta_d: 3.0  # Discriminative loss: push force margin
+
+# Logging & Checkpointing
+log_dir: ./logs/hdmapnet
+checkpoint_dir: ./checkpoints/hdmapnet
+log_interval: 50
+val_interval: 1
+save_interval: 1
+
+# Distributed
+distributed: false
+local_rank: 0

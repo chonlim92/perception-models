@@ -9,6 +9,7 @@ Reference: BEVFormer: Learning Bird's-Eye-View Representation from Multi-Camera
            Images via Spatiotemporal Transformers (ECCV 2022)
 """
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -547,8 +548,9 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         # Line-type embedding: 0=left boundary, 1=right boundary, 2=other
         self.line_type_embedding = nn.Embedding(3, embed_dim)
 
-        # Point-position embedding: ordinal position along the line (0..19)
-        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+        # Point-position embedding: hybrid sinusoidal + learned for ordinal prior
+        self._build_sinusoidal_base(points_per_line, embed_dim)
+        self.point_residual = nn.Embedding(points_per_line, embed_dim)
 
         # Learnable content queries (one per structural slot)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
@@ -561,10 +563,26 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self._init_weights()
         self._build_index_tables()
 
+    def _build_sinusoidal_base(self, num_points: int, embed_dim: int) -> None:
+        """Pre-compute fixed sinusoidal positional encoding for point ordering."""
+        pe = torch.zeros(num_points, embed_dim)
+        position = torch.arange(0, num_points, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embed_dim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / embed_dim)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        self.register_buffer("point_sinusoidal", pe)
+
+    def _point_embedding(self, point_ids: torch.Tensor) -> torch.Tensor:
+        """Hybrid point embedding: sinusoidal base + learned residual."""
+        return self.point_sinusoidal[point_ids] + self.point_residual(point_ids)
+
     def _init_weights(self) -> None:
         nn.init.normal_(self.lane_embedding.weight, std=0.02)
         nn.init.normal_(self.line_type_embedding.weight, std=0.02)
-        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_residual.weight, std=0.01)
         nn.init.normal_(self.content_embedding.weight, std=0.02)
 
     def _build_index_tables(self) -> None:
@@ -611,7 +629,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
-            + self.point_embedding(self.point_ids)
+            + self._point_embedding(self.point_ids)
         )
         pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
 

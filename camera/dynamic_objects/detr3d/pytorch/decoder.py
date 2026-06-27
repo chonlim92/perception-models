@@ -436,7 +436,8 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
 
         self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
         self.line_type_embedding = nn.Embedding(3, embed_dim)
-        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+        self._build_sinusoidal_base(points_per_line, embed_dim)
+        self.point_residual = nn.Embedding(points_per_line, embed_dim)
         self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
 
         self.pos_layer_norm = nn.LayerNorm(embed_dim)
@@ -446,10 +447,24 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self._init_weights()
         self._build_index_tables()
 
+    def _build_sinusoidal_base(self, num_points: int, embed_dim: int) -> None:
+        pe = torch.zeros(num_points, embed_dim)
+        position = torch.arange(0, num_points, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embed_dim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / embed_dim)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:embed_dim // 2])
+        self.register_buffer("point_sinusoidal", pe)
+
+    def _point_embedding(self, point_ids: torch.Tensor) -> torch.Tensor:
+        return self.point_sinusoidal[point_ids] + self.point_residual(point_ids)
+
     def _init_weights(self) -> None:
         nn.init.normal_(self.lane_embedding.weight, std=0.02)
         nn.init.normal_(self.line_type_embedding.weight, std=0.02)
-        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_residual.weight, std=0.01)
         nn.init.normal_(self.content_embedding.weight, std=0.02)
 
     def _build_index_tables(self) -> None:
@@ -482,7 +497,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         pos_embed = (
             self.lane_embedding(self.lane_ids)
             + self.line_type_embedding(self.line_type_ids)
-            + self.point_embedding(self.point_ids)
+            + self._point_embedding(self.point_ids)
         )
         pos_embed = self.pos_dropout(self.pos_layer_norm(pos_embed))
 
