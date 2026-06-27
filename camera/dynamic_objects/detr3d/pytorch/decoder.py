@@ -394,3 +394,254 @@ class DETR3DTransformerDecoder(nn.Module):
         """Inverse of sigmoid function, clamped for numerical stability."""
         x = x.clamp(min=eps, max=1 - eps)
         return torch.log(x / (1 - x))
+
+
+# =============================================================================
+# Hierarchical Lane Positional Embeddings for DETR3D
+# =============================================================================
+
+
+class HierarchicalLanePositionalEmbedding(nn.Module):
+    """Hierarchical positional embeddings encoding lane -> line -> point structure.
+
+    Each query's positional embedding is the sum of lane-level, line-type,
+    and point-position learned embeddings, providing explicit structural
+    knowledge for lane detection from multi-camera 3D features.
+
+    Query layout:
+        [0, num_lane_queries): 25 lanes × 2 lines × 20 points = 1000
+        [num_lane_queries, total): num_other_lines × 20 points
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+
+        self.num_lane_queries = num_lanes * 2 * points_per_line
+        self.num_other_queries = num_other_lines * points_per_line
+        self.total_queries = self.num_lane_queries + self.num_other_queries
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+
+        self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
+        self.line_type_embedding = nn.Embedding(3, embed_dim)
+        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+        self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
+
+        self._init_weights()
+        self._build_index_tables()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.lane_embedding.weight, std=0.02)
+        nn.init.normal_(self.line_type_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _build_index_tables(self) -> None:
+        lane_ids, line_type_ids, point_ids = [], [], []
+        for lane_idx in range(self.num_lanes):
+            for line_type in range(2):
+                for pt_idx in range(self.points_per_line):
+                    lane_ids.append(lane_idx)
+                    line_type_ids.append(line_type)
+                    point_ids.append(pt_idx)
+        for line_idx in range(self.num_other_lines):
+            for pt_idx in range(self.points_per_line):
+                lane_ids.append(self.num_lanes + line_idx)
+                line_type_ids.append(2)
+                point_ids.append(pt_idx)
+
+        self.register_buffer("lane_ids", torch.tensor(lane_ids, dtype=torch.long))
+        self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
+        self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (pos_embed, content_embed) each (total_queries, embed_dim)."""
+        pos_embed = (
+            self.lane_embedding(self.lane_ids)
+            + self.line_type_embedding(self.line_type_ids)
+            + self.point_embedding(self.point_ids)
+        )
+        return pos_embed, self.content_embedding.weight
+
+    def get_lane_mask(self) -> torch.Tensor:
+        """Return boolean mask identifying lane queries vs other-line queries."""
+        mask = torch.zeros(
+            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
+        )
+        mask[: self.num_lane_queries] = True
+        return mask
+
+
+class DETR3DLaneDecoder(nn.Module):
+    """DETR3D decoder adapted for lane detection with hierarchical positional embeddings.
+
+    Uses 3D-to-2D feature sampling cross-attention (as in DETR3D) but with
+    lane-structured queries: 25 lanes × 2 lines (left/right) × 20 points.
+    Each query has a 3D reference point that is iteratively refined and used
+    to sample features from multi-camera images.
+
+    The hierarchical structure lets the transformer exploit lane topology
+    (adjacent points on the same line, corresponding left/right boundaries)
+    through its self-attention mechanism.
+    """
+
+    def __init__(
+        self,
+        embed_dims: int = 256,
+        num_heads: int = 8,
+        ffn_dims: int = 1024,
+        num_layers: int = 6,
+        dropout: float = 0.1,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+        pc_range: Optional[List[float]] = None,
+    ):
+        """Initialize DETR3D lane detection decoder.
+
+        Args:
+            embed_dims: Embedding dimension.
+            num_heads: Number of attention heads.
+            ffn_dims: FFN hidden dimension.
+            num_layers: Number of decoder layers.
+            dropout: Dropout rate.
+            num_lanes: Number of lanes (each with left+right boundary).
+            points_per_line: Points per line (default 20).
+            num_other_lines: Additional non-lane polylines.
+            pc_range: Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max].
+        """
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.num_layers = num_layers
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+
+        if pc_range is None:
+            pc_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        self.pc_range = pc_range
+
+        # Hierarchical positional embeddings
+        self.hierarchical_pos = HierarchicalLanePositionalEmbedding(
+            embed_dim=embed_dims,
+            num_lanes=num_lanes,
+            points_per_line=points_per_line,
+            num_other_lines=num_other_lines,
+        )
+        self.total_queries = self.hierarchical_pos.total_queries
+
+        # Decoder layers
+        self.layers = nn.ModuleList([
+            DETR3DTransformerDecoderLayer(
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                ffn_dims=ffn_dims,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # 3D reference points for lane points (lanes are on the ground plane)
+        self.reference_points_embed = nn.Linear(embed_dims, 3)
+
+        # Per-layer refinement
+        self.ref_point_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dims, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 3),
+            )
+            for _ in range(num_layers)
+        ])
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.reference_points_embed.weight)
+        nn.init.zeros_(self.reference_points_embed.bias)
+        for head in self.ref_point_heads:
+            for m in head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(
+        self,
+        multi_scale_features: List[torch.Tensor],
+        intrinsics: torch.Tensor,
+        extrinsics: torch.Tensor,
+        image_shape: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """Forward pass for lane detection.
+
+        Args:
+            multi_scale_features: List of feature maps (B, num_cams, C, H, W).
+            intrinsics: Camera intrinsics (B, num_cams, 3, 3).
+            extrinsics: Camera extrinsics (B, num_cams, 4, 4).
+            image_shape: (H, W) of input images.
+
+        Returns:
+            query_outputs: Final query features (B, total_queries, embed_dims).
+            intermediate_outputs: List of per-layer outputs.
+            intermediate_ref_points: List of per-layer reference points (normalized).
+        """
+        batch_size = multi_scale_features[0].shape[0]
+
+        # Get hierarchical embeddings
+        hier_pos, hier_content = self.hierarchical_pos()
+
+        # Initialize queries and positional embeddings
+        query = hier_content.unsqueeze(0).expand(batch_size, -1, -1)
+        query_pos = hier_pos.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Initialize 3D reference points from combined embeddings
+        combined = hier_content + hier_pos
+        reference_points = self.reference_points_embed(combined).sigmoid()
+        reference_points = reference_points.unsqueeze(0).expand(batch_size, -1, -1)
+
+        intermediate_outputs = []
+        intermediate_ref_points = []
+
+        for layer_idx, layer in enumerate(self.layers):
+            ref_points_3d = self._denormalize_reference_points(reference_points)
+
+            query = layer(
+                query=query,
+                query_pos=query_pos,
+                reference_points=ref_points_3d,
+                multi_scale_features=multi_scale_features,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                image_shape=image_shape,
+            )
+
+            # Refine reference points
+            ref_delta = self.ref_point_heads[layer_idx](query)
+            new_ref_points = torch.sigmoid(
+                self._inverse_sigmoid(reference_points) + ref_delta
+            )
+            reference_points = new_ref_points.detach()
+
+            intermediate_outputs.append(query)
+            intermediate_ref_points.append(new_ref_points)
+
+        return query, intermediate_outputs, intermediate_ref_points
+
+    def _denormalize_reference_points(self, ref_points: torch.Tensor) -> torch.Tensor:
+        pc_range = torch.tensor(self.pc_range, device=ref_points.device, dtype=ref_points.dtype)
+        return ref_points * (pc_range[3:] - pc_range[:3]) + pc_range[:3]
+
+    @staticmethod
+    def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        x = x.clamp(min=eps, max=1 - eps)
+        return torch.log(x / (1 - x))

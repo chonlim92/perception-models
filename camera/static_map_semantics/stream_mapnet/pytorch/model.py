@@ -918,6 +918,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.num_lane_queries = num_lanes * 2 * points_per_line
         self.num_other_queries = num_other_lines * points_per_line
         self.total_queries = self.num_lane_queries + self.num_other_queries
+        self.num_total_lines = num_lanes * 2 + num_other_lines
 
         # Lane-level embedding: which lane (0..num_lanes-1) or other-line group
         self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
@@ -987,7 +988,9 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         Returns:
             (total_queries,) boolean tensor, True for lane queries.
         """
-        mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        mask = torch.zeros(
+            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
+        )
         mask[: self.num_lane_queries] = True
         return mask
 
@@ -1017,6 +1020,8 @@ class HierarchicalMapDecoder(nn.Module):
         points_per_line: int = 20,
         num_other_lines: int = 0,
         auxiliary_loss: bool = True,
+        bev_h: int = 25,
+        bev_w: int = 25,
     ):
         """Initialize hierarchical map decoder.
 
@@ -1031,6 +1036,8 @@ class HierarchicalMapDecoder(nn.Module):
             points_per_line: Points per line (default 20).
             num_other_lines: Non-lane polylines.
             auxiliary_loss: Whether to compute intermediate layer predictions.
+            bev_h: Expected BEV feature height (for positional encoding init).
+            bev_w: Expected BEV feature width (for positional encoding init).
         """
         super().__init__()
         self.num_decoder_layers = num_decoder_layers
@@ -1054,10 +1061,12 @@ class HierarchicalMapDecoder(nn.Module):
         # BEV feature projection
         self.bev_proj = nn.Conv2d(bev_channels, d_model, kernel_size=1)
 
-        # Learnable BEV positional encoding
-        self.bev_pos_embed = None
-        self._bev_h = None
-        self._bev_w = None
+        # Learnable BEV positional encoding (initialized at construction)
+        self.bev_pos_embed = nn.Parameter(
+            torch.randn(1, bev_h * bev_w, d_model) * 0.02
+        )
+        self._bev_h = bev_h
+        self._bev_w = bev_w
 
         # Decoder layers
         self.layers = nn.ModuleList([
@@ -1083,14 +1092,13 @@ class HierarchicalMapDecoder(nn.Module):
         )
 
     def _get_bev_pos(self, H: int, W: int, device: torch.device) -> torch.Tensor:
-        """Get or create BEV positional encoding."""
-        if self.bev_pos_embed is None or self._bev_h != H or self._bev_w != W:
-            self._bev_h = H
-            self._bev_w = W
-            self.bev_pos_embed = nn.Parameter(
-                torch.randn(1, H * W, self.d_model, device=device) * 0.02
-            )
-        return self.bev_pos_embed
+        """Get BEV positional encoding, interpolating if spatial size changed."""
+        if H == self._bev_h and W == self._bev_w:
+            return self.bev_pos_embed
+        pos = self.bev_pos_embed.view(1, self._bev_h, self._bev_w, self.d_model)
+        pos = pos.permute(0, 3, 1, 2)
+        pos = F.interpolate(pos, size=(H, W), mode="bilinear", align_corners=False)
+        return pos.permute(0, 2, 3, 1).reshape(1, H * W, self.d_model)
 
     def forward(
         self, bev_features: torch.Tensor

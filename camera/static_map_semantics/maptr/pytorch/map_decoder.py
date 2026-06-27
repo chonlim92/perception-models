@@ -498,3 +498,298 @@ class MapDecoder(nn.Module):
             intermediate_ref_pts.append(ref)
 
         return intermediate_outputs, intermediate_ref_pts
+
+
+# =============================================================================
+# Hierarchical Lane Positional Embeddings for MapTR
+# =============================================================================
+
+
+class HierarchicalLanePositionalEmbedding(nn.Module):
+    """Hierarchical positional embeddings encoding lane -> line -> point structure.
+
+    Replaces MapTR's generic instance_queries + point_queries with an explicit
+    lane topology: each query's position is the sum of its lane-level,
+    line-type (left/right/other), and point-position embeddings.
+
+    Query layout (in order):
+        [0, num_lane_queries): Lane queries organized as
+            lane_0_left_pt0, ..., lane_0_left_pt19,
+            lane_0_right_pt0, ..., lane_0_right_pt19,
+            lane_1_left_pt0, ...  (num_lanes × 2 lines × points_per_line)
+        [num_lane_queries, total_queries): Other line queries organized as
+            line_0_pt0, ..., line_0_pt19,
+            line_1_pt0, ...  (num_other_lines × points_per_line)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+
+        self.num_lane_queries = num_lanes * 2 * points_per_line
+        self.num_other_queries = num_other_lines * points_per_line
+        self.total_queries = self.num_lane_queries + self.num_other_queries
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+
+        # Lane-level embedding: which lane or other-line group
+        self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
+        # Line-type embedding: 0=left boundary, 1=right boundary, 2=other
+        self.line_type_embedding = nn.Embedding(3, embed_dim)
+        # Point-position embedding: ordinal position along the line
+        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+        # Content queries (one per structural slot)
+        self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
+
+        self._init_weights()
+        self._build_index_tables()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.lane_embedding.weight, std=0.02)
+        nn.init.normal_(self.line_type_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _build_index_tables(self) -> None:
+        lane_ids, line_type_ids, point_ids = [], [], []
+        for lane_idx in range(self.num_lanes):
+            for line_type in range(2):  # 0=left, 1=right
+                for pt_idx in range(self.points_per_line):
+                    lane_ids.append(lane_idx)
+                    line_type_ids.append(line_type)
+                    point_ids.append(pt_idx)
+        for line_idx in range(self.num_other_lines):
+            for pt_idx in range(self.points_per_line):
+                lane_ids.append(self.num_lanes + line_idx)
+                line_type_ids.append(2)
+                point_ids.append(pt_idx)
+
+        self.register_buffer("lane_ids", torch.tensor(lane_ids, dtype=torch.long))
+        self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
+        self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (positional_embedding, content_embedding) each (total_queries, embed_dim)."""
+        pos_embed = (
+            self.lane_embedding(self.lane_ids)
+            + self.line_type_embedding(self.line_type_ids)
+            + self.point_embedding(self.point_ids)
+        )
+        return pos_embed, self.content_embedding.weight
+
+    def get_lane_mask(self) -> torch.Tensor:
+        """Return boolean mask identifying lane queries vs other-line queries."""
+        mask = torch.zeros(
+            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
+        )
+        mask[: self.num_lane_queries] = True
+        return mask
+
+
+class HierarchicalLaneMapDecoder(nn.Module):
+    """MapTR decoder with hierarchical lane-structured positional embeddings.
+
+    Extends MapTR's decoder by replacing generic instance+point queries with
+    explicit lane→line→point hierarchy (25 lanes × 2 lines × 20 points).
+    Retains MapTR's iterative refinement and decoupled self-attention features.
+
+    Compared to the base MapDecoder:
+    - Instance queries are replaced by lane+line_type embeddings
+    - Point queries are replaced by point-position embeddings
+    - The combined positional embedding encodes the full topology
+    - Iterative reference point refinement is preserved
+    """
+
+    def __init__(
+        self,
+        embed_dims: int = 256,
+        num_heads: int = 8,
+        ffn_dims: int = 1024,
+        num_layers: int = 6,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        self_attn_mask_type: str = "decoupled",
+        return_intermediate: bool = True,
+    ):
+        """Initialize hierarchical lane map decoder.
+
+        Args:
+            embed_dims: Embedding dimension.
+            num_heads: Number of attention heads per layer.
+            ffn_dims: FFN hidden dimension.
+            num_layers: Number of decoder layers.
+            num_lanes: Number of lanes (each with left+right boundary).
+            points_per_line: Points sampled per line (default 20).
+            num_other_lines: Non-lane polylines (road edges, crosswalks).
+            dropout: Dropout probability.
+            activation: Activation function name.
+            self_attn_mask_type: "none" or "decoupled" (block-diagonal).
+            return_intermediate: Return intermediate layer outputs.
+        """
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.num_layers = num_layers
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+        self.return_intermediate = return_intermediate
+
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+
+        # Hierarchical positional embeddings
+        self.hierarchical_pos = HierarchicalLanePositionalEmbedding(
+            embed_dim=embed_dims,
+            num_lanes=num_lanes,
+            points_per_line=points_per_line,
+            num_other_lines=num_other_lines,
+        )
+        self.total_queries = self.hierarchical_pos.total_queries
+
+        # Reference points initialization from combined query embeddings
+        self.reference_points_embed = nn.Linear(embed_dims, 2)
+
+        # Decoder layers
+        self.layers = nn.ModuleList([
+            MapDecoderLayer(
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                ffn_dims=ffn_dims,
+                dropout=dropout,
+                activation=activation,
+                self_attn_mask_type=self_attn_mask_type,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Per-layer refinement MLPs
+        self.refinement_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dims, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 2),
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Query positional encoding projection (from 2D ref points to embed_dims)
+        self.query_pos_proj = nn.Sequential(
+            nn.Linear(2, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+        )
+
+        # BEV positional encoding
+        self.bev_pos_enc = PositionalEncoding2D(embed_dims)
+
+        # Final norm
+        self.final_norm = nn.LayerNorm(embed_dims)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.reference_points_embed.weight)
+        nn.init.zeros_(self.reference_points_embed.bias)
+        for mlp in self.refinement_mlps:
+            for layer in mlp:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+        for layer in self.query_pos_proj:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+    def forward(
+        self, bev_features: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Forward pass of the hierarchical lane decoder.
+
+        Args:
+            bev_features: BEV feature map [B, C, H, W].
+
+        Returns:
+            Tuple of:
+                - intermediate_outputs: List of query features per layer,
+                  each [B, num_total_lines, points_per_line, embed_dims].
+                - intermediate_ref_pts: List of reference points per layer,
+                  each [B, num_total_lines, points_per_line, 2].
+        """
+        batch_size, c, h, w = bev_features.shape
+
+        # Prepare BEV memory
+        memory = bev_features.flatten(2).permute(0, 2, 1)
+        bev_pos = self.bev_pos_enc((h, w), bev_features.device)
+        memory_pos = bev_pos.flatten(2).permute(0, 2, 1).expand(batch_size, -1, -1)
+
+        # Build hierarchical queries
+        hier_pos, hier_content = self.hierarchical_pos()
+        query = hier_content.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Initialize reference points
+        reference_points = self.reference_points_embed(
+            hier_content + hier_pos
+        ).sigmoid()
+        reference_points = reference_points.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Iterative decoding
+        intermediate_outputs = []
+        intermediate_ref_pts = []
+
+        for layer_idx, (decoder_layer, refine_mlp) in enumerate(
+            zip(self.layers, self.refinement_mlps)
+        ):
+            # Positional encoding from reference points + hierarchical structure
+            query_pos = self.query_pos_proj(reference_points) + hier_pos.unsqueeze(0)
+
+            # Apply decoder layer
+            query = decoder_layer(
+                query=query,
+                query_pos=query_pos,
+                memory=memory,
+                memory_pos=memory_pos,
+                num_queries=self.num_total_lines,
+                num_points=self.points_per_line,
+            )
+
+            # Iterative refinement
+            delta = refine_mlp(query)
+            new_ref_pts = (
+                torch.special.logit(reference_points.clamp(1e-5, 1 - 1e-5)) + delta
+            ).sigmoid()
+            reference_points = new_ref_pts.detach()
+
+            # Store intermediate results
+            if self.return_intermediate:
+                normed_query = self.final_norm(query)
+                out = normed_query.reshape(
+                    batch_size, self.num_total_lines, self.points_per_line, self.embed_dims
+                )
+                intermediate_outputs.append(out)
+                ref = new_ref_pts.reshape(
+                    batch_size, self.num_total_lines, self.points_per_line, 2
+                )
+                intermediate_ref_pts.append(ref)
+
+        if not self.return_intermediate:
+            normed_query = self.final_norm(query)
+            out = normed_query.reshape(
+                batch_size, self.num_total_lines, self.points_per_line, self.embed_dims
+            )
+            intermediate_outputs.append(out)
+            ref = new_ref_pts.reshape(
+                batch_size, self.num_total_lines, self.points_per_line, 2
+            )
+            intermediate_ref_pts.append(ref)
+
+        return intermediate_outputs, intermediate_ref_pts

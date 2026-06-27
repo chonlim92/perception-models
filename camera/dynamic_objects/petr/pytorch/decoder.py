@@ -390,3 +390,247 @@ class PETRTransformerDecoder(nn.Module):
         intermediate_outputs_stacked = torch.stack(intermediate_outputs, dim=0)
 
         return output, intermediate_outputs, intermediate_ref_pts
+
+
+# =============================================================================
+# Hierarchical Lane Positional Embeddings for PETR
+# =============================================================================
+
+
+class HierarchicalLanePositionalEmbedding(nn.Module):
+    """Hierarchical positional embeddings encoding lane -> line -> point structure.
+
+    Each query's positional embedding is the sum of lane-level, line-type,
+    and point-position learned embeddings. Designed to replace flat query
+    embeddings when using PETR for lane detection tasks.
+
+    Query layout:
+        [0, num_lane_queries): 25 lanes × 2 lines × 20 points = 1000
+        [num_lane_queries, total): num_other_lines × 20 points
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+
+        self.num_lane_queries = num_lanes * 2 * points_per_line
+        self.num_other_queries = num_other_lines * points_per_line
+        self.total_queries = self.num_lane_queries + self.num_other_queries
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+
+        self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
+        self.line_type_embedding = nn.Embedding(3, embed_dim)
+        self.point_embedding = nn.Embedding(points_per_line, embed_dim)
+        self.content_embedding = nn.Embedding(self.total_queries, embed_dim)
+
+        self._init_weights()
+        self._build_index_tables()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.lane_embedding.weight, std=0.02)
+        nn.init.normal_(self.line_type_embedding.weight, std=0.02)
+        nn.init.normal_(self.point_embedding.weight, std=0.02)
+        nn.init.normal_(self.content_embedding.weight, std=0.02)
+
+    def _build_index_tables(self) -> None:
+        lane_ids, line_type_ids, point_ids = [], [], []
+        for lane_idx in range(self.num_lanes):
+            for line_type in range(2):
+                for pt_idx in range(self.points_per_line):
+                    lane_ids.append(lane_idx)
+                    line_type_ids.append(line_type)
+                    point_ids.append(pt_idx)
+        for line_idx in range(self.num_other_lines):
+            for pt_idx in range(self.points_per_line):
+                lane_ids.append(self.num_lanes + line_idx)
+                line_type_ids.append(2)
+                point_ids.append(pt_idx)
+
+        self.register_buffer("lane_ids", torch.tensor(lane_ids, dtype=torch.long))
+        self.register_buffer("line_type_ids", torch.tensor(line_type_ids, dtype=torch.long))
+        self.register_buffer("point_ids", torch.tensor(point_ids, dtype=torch.long))
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (pos_embed, content_embed) each (total_queries, embed_dim)."""
+        pos_embed = (
+            self.lane_embedding(self.lane_ids)
+            + self.line_type_embedding(self.line_type_ids)
+            + self.point_embedding(self.point_ids)
+        )
+        return pos_embed, self.content_embedding.weight
+
+    def get_lane_mask(self) -> torch.Tensor:
+        """Return boolean mask identifying lane queries vs other-line queries."""
+        mask = torch.zeros(
+            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
+        )
+        mask[: self.num_lane_queries] = True
+        return mask
+
+
+class PETRLaneDecoder(nn.Module):
+    """PETR decoder adapted for lane detection with hierarchical positional embeddings.
+
+    Uses PETR's global cross-attention to 3D position-aware image features,
+    but with lane-structured queries: 25 lanes × 2 lines × 20 points.
+    Each query has a 3D reference point that is iteratively refined.
+
+    PETR's key advantage for lane detection: position-aware features encode
+    3D geometry directly, so lane queries can attend to relevant 3D locations
+    without explicit projection (unlike DETR3D's feature sampling approach).
+    """
+
+    def __init__(
+        self,
+        num_layers: int = 6,
+        embed_dims: int = 256,
+        num_heads: int = 8,
+        feedforward_dims: int = 2048,
+        dropout: float = 0.1,
+        num_lanes: int = 25,
+        points_per_line: int = 20,
+        num_other_lines: int = 0,
+        return_intermediate: bool = True,
+    ) -> None:
+        """Initialize PETR lane detection decoder.
+
+        Args:
+            num_layers: Number of decoder layers.
+            embed_dims: Embedding dimension.
+            num_heads: Number of attention heads.
+            feedforward_dims: FFN hidden dimension.
+            dropout: Dropout rate.
+            num_lanes: Number of lanes (each with left+right boundary).
+            points_per_line: Points per line (default 20).
+            num_other_lines: Additional non-lane polylines.
+            return_intermediate: Return all layer outputs for auxiliary loss.
+        """
+        super().__init__()
+        self.num_layers = num_layers
+        self.embed_dims = embed_dims
+        self.num_lanes = num_lanes
+        self.points_per_line = points_per_line
+        self.num_other_lines = num_other_lines
+        self.num_total_lines = num_lanes * 2 + num_other_lines
+        self.return_intermediate = return_intermediate
+
+        # Hierarchical positional embeddings
+        self.hierarchical_pos = HierarchicalLanePositionalEmbedding(
+            embed_dim=embed_dims,
+            num_lanes=num_lanes,
+            points_per_line=points_per_line,
+            num_other_lines=num_other_lines,
+        )
+        self.total_queries = self.hierarchical_pos.total_queries
+
+        # Decoder layers
+        self.layers = nn.ModuleList([
+            TransformerDecoderLayer(
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                feedforward_dims=feedforward_dims,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # 3D reference points (lanes are ground-plane structures)
+        self.reference_points_proj = nn.Linear(embed_dims, 3)
+
+        # Per-layer refinement heads
+        self.reg_branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dims, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 3),
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(embed_dims)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.reference_points_proj.weight)
+        nn.init.zeros_(self.reference_points_proj.bias)
+        for branch in self.reg_branches:
+            for m in branch.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_pos: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """Forward pass for lane detection.
+
+        Args:
+            key: Position-aware image features (B, K, C).
+            value: Image features (B, K, C).
+            key_pos: Position embedding for keys (B, K, C), or None if
+                already encoded in key.
+            key_padding_mask: Padding mask for keys (B, K).
+
+        Returns:
+            query_output: Final queries (B, total_queries, embed_dims).
+            intermediate_outputs: Per-layer normalized outputs.
+            intermediate_ref_pts: Per-layer reference points (normalized).
+        """
+        batch_size = key.shape[0]
+
+        # Get hierarchical embeddings
+        hier_pos, hier_content = self.hierarchical_pos()
+
+        # Initialize queries and positional embeddings
+        query = hier_content.unsqueeze(0).expand(batch_size, -1, -1)
+        query_pos = hier_pos.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Initialize 3D reference points
+        combined = hier_content + hier_pos
+        reference_points = self.reference_points_proj(combined).sigmoid()
+        reference_points = reference_points.unsqueeze(0).expand(batch_size, -1, -1)
+
+        intermediate_outputs = []
+        intermediate_ref_pts = []
+
+        for layer_idx, layer in enumerate(self.layers):
+            query = layer(
+                query=query,
+                key=key,
+                value=value,
+                query_pos=query_pos,
+                key_pos=key_pos,
+                key_padding_mask=key_padding_mask,
+            )
+
+            # Iterative refinement in inverse-sigmoid (logit) space
+            ref_delta = self.reg_branches[layer_idx](query)
+            inv_ref = torch.log(
+                reference_points.clamp(1e-5, 1 - 1e-5)
+                / (1 - reference_points.clamp(1e-5, 1 - 1e-5))
+            )
+            new_ref_pts = (inv_ref + ref_delta).sigmoid()
+            reference_points = new_ref_pts.detach()
+
+            if self.return_intermediate:
+                intermediate_outputs.append(self.final_norm(query))
+                intermediate_ref_pts.append(new_ref_pts)
+
+        if not self.return_intermediate:
+            intermediate_outputs.append(self.final_norm(query))
+            intermediate_ref_pts.append(new_ref_pts)
+
+        return query, intermediate_outputs, intermediate_ref_pts

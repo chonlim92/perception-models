@@ -535,6 +535,7 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         self.num_lane_queries = num_lanes * 2 * points_per_line
         self.num_other_queries = num_other_lines * points_per_line
         self.total_queries = self.num_lane_queries + self.num_other_queries
+        self.num_total_lines = num_lanes * 2 + num_other_lines
 
         # Lane-level embedding: which lane (0..num_lanes-1) or other-line group
         self.lane_embedding = nn.Embedding(num_lanes + num_other_lines, embed_dim)
@@ -604,7 +605,9 @@ class HierarchicalLanePositionalEmbedding(nn.Module):
         Returns:
             (total_queries,) boolean tensor, True for lane queries.
         """
-        mask = torch.zeros(self.total_queries, dtype=torch.bool)
+        mask = torch.zeros(
+            self.total_queries, dtype=torch.bool, device=self.lane_ids.device
+        )
         mask[: self.num_lane_queries] = True
         return mask
 
@@ -735,14 +738,11 @@ class LaneDetectionDecoder(nn.Module):
         query = self.norm(query)
         pred_points = self.point_reg_head(query).sigmoid()  # (B, Q, 2)
 
-        # Per-line confidence: pool points belonging to each line
+        # Per-line confidence: pool points belonging to each line (vectorized)
         num_total_lines = self.num_lanes * 2 + self.num_other_lines
-        line_features = pred_points.new_zeros(batch_size, num_total_lines, self.embed_dim)
-
-        for line_idx in range(num_total_lines):
-            start = line_idx * self.points_per_line
-            end = start + self.points_per_line
-            line_features[:, line_idx] = query[:, start:end].mean(dim=1)
+        line_features = query.reshape(
+            batch_size, num_total_lines, self.points_per_line, self.embed_dim
+        ).mean(dim=2)  # (B, num_lines, embed_dim)
 
         lane_logits = self.lane_cls_head(line_features).squeeze(-1)  # (B, num_lines)
 
